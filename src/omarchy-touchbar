@@ -213,6 +213,52 @@ SPINNER = "\u25d0\u25d3\u25d1\u25d2"
 MODEL_CHOICES = ("opus", "sonnet", "haiku", "fable")
 EFFORT_CHOICES = ("auto", "low", "medium", "high", "xhigh")
 
+# tiny-dfr's hit test ignores touches in the top and bottom 10% of the panel
+# (hit() in main.rs), tuned for its stock 15%-85% pills. Ours are full height,
+# so Action buttons went dead along the bottom edge while daemon buttons - our
+# own watcher ignores Y - kept working. Uniform fix: no button carries a
+# tiny-dfr Action; the daemon fires key chords itself through wtype, a virtual
+# keyboard, which Hyprland runs through its binds exactly like a real one (so
+# SUPER+Return still opens a terminal).
+WTYPE_MODS = {"LeftCtrl": "ctrl", "LeftShift": "shift",
+              "LeftAlt": "alt", "LeftMeta": "logo"}
+WTYPE_KEYS = {
+    "Enter": "Return", "Esc": "Escape", "Space": "space",
+    "Backspace": "BackSpace", "PageUp": "Page_Up", "PageDown": "Page_Down",
+    "Dot": "period", "Comma": "comma", "Slash": "slash", "Minus": "minus",
+    "Equal": "equal", "Grave": "grave", "Backslash": "backslash",
+    "Semicolon": "semicolon", "Apostrophe": "apostrophe",
+    "LeftBrace": "bracketleft", "RightBrace": "bracketright",
+    "PlayPause": "XF86AudioPlay", "NextSong": "XF86AudioNext",
+    "PreviousSong": "XF86AudioPrev", "MicMute": "XF86AudioMicMute",
+    "Mute": "XF86AudioMute", "VolumeUp": "XF86AudioRaiseVolume",
+    "VolumeDown": "XF86AudioLowerVolume",
+}
+
+
+def wtype_args(keys):
+    """A parsed chord -> wtype arguments, modifiers held around the key."""
+    names = parse_chord(keys) if isinstance(keys, str) else list(keys or [])
+    mods = [WTYPE_MODS[n] for n in names if n in WTYPE_MODS]
+    rest = [n for n in names if n not in WTYPE_MODS]
+    if not rest:
+        return None
+    key = rest[-1]
+    if key in WTYPE_KEYS:
+        key = WTYPE_KEYS[key]
+    elif key.startswith("Num") and len(key) == 4:
+        key = key[3]
+    elif len(key) == 1:
+        key = key.lower()
+    args = []
+    for mod in mods:
+        args += ["-M", mod]
+    args += ["-k", key]
+    for mod in reversed(mods):
+        args += ["-m", mod]
+    return args
+
+
 PERMISSION_LABELS = {
     "auto": "auto", "default": "ask", "normal": "ask", "plan": "plan",
     "acceptEdits": "edits", "bypassPermissions": "bypass",
@@ -1548,9 +1594,6 @@ class TouchBar:
                 build_svg(painted, width, radius, settings["font"], scale)
             )
             fields = ["Icon = %s" % toml_string(name or "search")]
-            action = action_field(item.get("keys"))
-            if action:
-                fields.append(action)
             fields.append("IconWidth = %d" % int(width))
             fields.append("IconHeight = %d" % BAR_HEIGHT)
             rows.append("    { %s }," % ", ".join(fields))
@@ -1560,7 +1603,11 @@ class TouchBar:
         with self.lock:
             self.reload_if_changed()
             specs = self.specs()
-            actions = [None] + [item.get("daemon") for item in specs]
+            actions = [None] + [
+                item.get("daemon")
+                or ("keys:%s" % item["keys"] if item.get("keys") else None)
+                for item in specs
+            ]
             changed = [
                 i for i, item in enumerate(specs)
                 if i >= len(self.prev_specs) or self.prev_specs[i] != item
@@ -1705,6 +1752,11 @@ class TouchBar:
                 self.page = "auto" if self.page == value else value
             self.prev_specs = []  # no decorative transition on navigation UI
             self.render()
+        elif kind == "keys" and value:
+            args = wtype_args(value)
+            if args:
+                subprocess.Popen(["wtype"] + args, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
         elif kind == "media":
             if value == "mute":
                 self.media.toggle_mute()
@@ -2016,6 +2068,18 @@ def watch_touches(bar):
         time.sleep(2)
 
 
+def watch_media(bar):
+    """Poll MPRIS off the animation path: busctl blocks for most of a second
+    when the system is loaded, and a stall here must not freeze the spinner."""
+    was_active = False
+    while True:
+        bar.media.refresh(interval=0)
+        if bar.media.active != was_active:
+            was_active = bar.media.active
+            bar.render()          # transport appeared or disappeared
+        time.sleep(1.5)
+
+
 def keep_awake(bar):
     """Hold the Touch Bar lit while something is actually happening.
 
@@ -2266,7 +2330,6 @@ def animate_live_states(bar):
     while True:
         active = bar.active_window()
         chatgpt_visible = re.search(r"^(chatgpt|ChatGPT)$", active.get("class", ""))
-        bar.media.refresh()
         moving = bar.voice_state in ("recording", "transcribing") \
             or (chatgpt_visible and bar.chatgpt_thinking) \
             or bar.media.playing
@@ -2344,6 +2407,7 @@ def run_daemon():
     threading.Thread(target=animate_live_states, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_claude, args=(bar,), daemon=True).start()
     threading.Thread(target=keep_awake, args=(bar,), daemon=True).start()
+    threading.Thread(target=watch_media, args=(bar,), daemon=True).start()
     threading.Thread(target=serve, args=(bar,), daemon=True).start()
     bar.render()
     watch_hyprland(bar)

@@ -21,6 +21,9 @@ full-height, animated interface that follows the focused app.
 - Animated SVG buttons colored from the active Omarchy theme
 - Window launcher, media/function layer, app dock, and live battery/clock options
 - Touch-safe rendering that prevents `tiny-dfr` reloads while a finger is down
+- Full-height touch targets: every tap is resolved by the daemon from the raw
+  digitizer, so buttons work edge to edge (tiny-dfr's own hit test ignores the
+  top and bottom 10% of the panel)
 - Fn-safe rendering that keeps classic brightness, keyboard-light, playback,
   microphone, search, and volume controls usable for the full key hold
 
