@@ -74,6 +74,14 @@ KEY_FN = 0x1D0
 ABS_X = 0x00
 ABS_MT_POSITION_X = 0x35
 TOUCH_GRACE = 0.05
+# If a finger-up or Fn-up event is ever missed - a device read breaking and the
+# watcher reconnecting is enough - the gate would swallow every repaint from
+# then on and the bar would sit there stale or blank. Nothing legitimately
+# holds a frame this long, so past it we write regardless.
+GATE_TIMEOUT = 1.5
+# tiny-dfr dims at 30s and blanks at 60s of no input. Hold the panel lit for a
+# while after its contents change, so switching apps never lands on a dark bar.
+AWAKE_AFTER_CHANGE = 40.0
 
 ANIMATION_FRAMES = (0.80, 0.92)
 ANIMATION_STEP = 0.04
@@ -849,6 +857,8 @@ class TouchBar:
         self.lock = threading.Lock()
         self.write_lock = threading.Lock()
         self.pending = None
+        self.pending_since = 0.0
+        self.last_change = 0.0
         self.pending_actions = None
         self.touch_actions = [None] * (int(self.config["settings"]["slots"]) + 1)
         self.last_touch = None
@@ -1587,11 +1597,15 @@ class TouchBar:
                 return
             if text == self.last_written:
                 return
+            if self.pending is None:
+                self.pending_since = time.monotonic()
             self.pending = text
             self.pending_actions = actions
         self.flush()
 
     def touch_settled(self):
+        if self.pending_since and time.monotonic() - self.pending_since > GATE_TIMEOUT:
+            return True                 # watchdog: never stall the bar
         return not self.fn_down and not self.touch_down and (
             time.monotonic() - self.touch_released_at > TOUCH_GRACE
         )
@@ -1603,11 +1617,13 @@ class TouchBar:
                 return
             text, self.pending = self.pending, None
             actions, self.pending_actions = self.pending_actions, None
+            self.pending_since = 0.0
             try:
                 # In place, not an atomic rename: tiny-dfr watches this inode.
                 with open(DFR_CONFIG, "w") as handle:
                     handle.write(text)
                 self.last_written = text
+                self.last_change = time.monotonic()
                 if actions is not None:
                     self.touch_actions = actions
             except OSError as exc:
@@ -1996,6 +2012,7 @@ def watch_touches(bar):
                                             "omarchy-touchbar: touch action failed: %s\n" % exc)
         except OSError:
             pass
+        bar.touch_down = False          # never latch the gate across a reconnect
         time.sleep(2)
 
 
@@ -2020,7 +2037,8 @@ def keep_awake(bar):
     path = os.path.join(TOUCHBAR_BACKLIGHT, "brightness")
     complained = False
     while True:
-        busy = bar.voice_state in ("recording", "transcribing") \
+        recent = time.monotonic() - bar.last_change < AWAKE_AFTER_CHANGE
+        busy = recent or bar.voice_state in ("recording", "transcribing") \
             or (bar.claude is not None and bar.claude.busy)
         if busy:
             try:
