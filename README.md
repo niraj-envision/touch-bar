@@ -13,8 +13,9 @@ full-height, animated interface that follows the focused app.
 - Always-available dictation while typing, with recording/transcribing states
 - Native ChatGPT dictation plus Claude-style live model, context, output,
   turns, tools, elapsed-time, task, and rate-limit telemetry
-- Claude Code read-out: live spinner with the running tool, context gauge,
-  output, rolling 7-day and all-time token totals, expandable to full stats
+- Claude Code read-out: live spinner with the running tool, real session/weekly/
+  model rate-limit gauges with reset countdowns, context gauge, expandable to
+  full session stats
 - Animated SVG buttons colored from the active Omarchy theme
 - Window launcher, media/function layer, app dock, and live battery/clock options
 - Touch-safe rendering that prevents `tiny-dfr` reloads while a finger is down
@@ -78,20 +79,22 @@ Tapping any read-out tile expands it into a full stats page: session name,
 model, permission mode, turns, elapsed, top tools, context, window, cached
 tokens, and plan tier.
 
-### Weekly usage
+### Rate limits
 
-Anthropic does not publish your weekly allowance anywhere on disk — `/usage`
-fetches it from the API at runtime. The `week` tile therefore reports the last
-seven days of tokens counted from transcript timestamps, and `remaining` shows
-`∞ no cap` until you give it a number to measure against:
+Claude Code refreshes its own `/usage` figures into `~/.claude.json` under
+`cachedUsageUtilization`, so the bar reads the real numbers straight off disk —
+no API call and no contact with the OAuth token. The three gauges show headroom
+**remaining** with the reset countdown: the 5-hour session window, the weekly
+limit, and the model-scoped weekly limit (currently Fable). They run green →
+yellow → red as they fill, and grey out if the cache goes stale.
+
+If no model-scoped bucket is reported, the third gauge falls back to a local
+7-day token count, which you can turn into a percentage by setting a budget:
 
 ```toml
 [settings]
 claude_weekly_budget = 500000000   # tokens; 0 disables the gauge
 ```
-
-With a budget set, both tiles become percentage gauges that run green → yellow →
-red as the week fills up.
 
 ## Architecture
 

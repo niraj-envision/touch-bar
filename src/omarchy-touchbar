@@ -250,6 +250,91 @@ def session_status(pid):
         return {}
 
 
+CLAUDE_CONFIG = os.path.join(HOME, ".claude.json")
+
+
+def until(iso):
+    """'2026-09-06T15:00:00+00:00' -> '6d'. Empty when it has already passed."""
+    target = stamp_to_epoch(iso)
+    if not target:
+        return ""
+    left = target - time.time()
+    if left <= 0:
+        return ""
+    if left >= 86400:
+        return "%dd" % round(left / 86400)
+    if left >= 3600:
+        return "%dh" % round(left / 3600)
+    return "%dm" % max(1, round(left / 60))
+
+
+class UsageLimits:
+    """Claude Code's own cached rate-limit read-out.
+
+    This is what `/usage` renders. Claude Code refreshes it into ~/.claude.json
+    under `cachedUsageUtilization`, so the real session and weekly headroom is
+    available without an API call and without touching the OAuth token.
+
+    `limits` is a list of {kind, percent, severity, resets_at, scope}; kinds are
+    `session`, `weekly_all` and `weekly_scoped` (scoped to a model, e.g. Fable).
+    `percent` is the share *used*.
+    """
+
+    def __init__(self):
+        self.stamp = None
+        self.entries = {}
+        self.fetched = 0.0
+        self.checked = 0.0
+
+    def refresh(self, interval=10.0):
+        now = time.monotonic()
+        if now - self.checked < interval:
+            return
+        self.checked = now
+        try:
+            info = os.stat(CLAUDE_CONFIG)
+        except OSError:
+            return
+        stamp = (info.st_mtime, info.st_size)
+        if stamp == self.stamp:
+            return
+        self.stamp = stamp
+        try:
+            with open(CLAUDE_CONFIG) as handle:
+                cached = (json.load(handle) or {}).get("cachedUsageUtilization") or {}
+        except (OSError, ValueError):
+            return
+        self.fetched = (cached.get("fetchedAtMs") or 0) / 1000.0
+        entries = {}
+        for item in ((cached.get("utilization") or {}).get("limits") or []):
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("kind") or ""
+            model = ((item.get("scope") or {}).get("model") or {}).get("display_name")
+            if kind == "weekly_scoped":
+                kind = "weekly_" + (model or "model").lower().replace(" ", "")
+            entries[kind] = {
+                "percent": item.get("percent"),
+                "resets_at": item.get("resets_at"),
+                "severity": item.get("severity") or "normal",
+                "model": model or "",
+            }
+        self.entries = entries
+
+    def get(self, kind):
+        return self.entries.get(kind)
+
+    def scoped_kind(self):
+        """The model-scoped weekly bucket, whatever model it is scoped to."""
+        for kind in self.entries:
+            if kind.startswith("weekly_") and kind != "weekly_all":
+                return kind
+        return None
+
+    def stale(self):
+        return self.fetched and (time.time() - self.fetched) > 3600
+
+
 class ClaudeTotals:
     """Running token totals across every Claude Code transcript on this machine.
 
@@ -689,6 +774,7 @@ class TouchBar:
         self.claude_phase = 0
         self.claude_probe = (None, 0.0, None)   # (window pid, checked at, claude pid)
         self.totals = ClaudeTotals()
+        self.limits = UsageLimits()
 
     def _stamps(self):
         out = []
@@ -762,6 +848,7 @@ class TouchBar:
         self.claude.reported = record.get("status") or ""
         self.claude.name = record.get("name") or ""
         self.totals.refresh()
+        self.limits.refresh()
         return self.claude
 
     def claude_profile(self):
@@ -830,6 +917,24 @@ class TouchBar:
             ))
         return rows
 
+    def limit_tile(self, kind, caption):
+        """Headroom left on one rate-limit bucket, with its reset countdown."""
+        info = self.limits.get(kind)
+        if not info or info.get("percent") is None:
+            return spec("\u2013", None, fill="sunken", fg="muted", size=21,
+                        gloss=False, sub=caption)
+        left = max(0, 100 - int(info["percent"]))
+        if info.get("severity") in ("warning", "critical"):
+            color = "red"
+        else:
+            color = "green" if left > 40 else "yellow" if left > 15 else "red"
+        when = until(info.get("resets_at"))
+        return spec("%d%%" % left, None, fill="sunken",
+                    fg="muted" if self.limits.stale() else "fg",
+                    size=21, gloss=False,
+                    sub="%s %s" % (caption, when) if when else caption,
+                    gauge=left / 100.0, bar=color, track="darker_background")
+
     def claude_tiles(self, session):
         """Live session read-out: what it is doing, and what it has spent."""
         settings = self.config["settings"]
@@ -857,38 +962,32 @@ class TouchBar:
                        size=21, gloss=False, sub=compact(session.context),
                        gauge=used, bar=bar_color, track="darker_background")
 
-        week = self.totals.week()
-        budget = int(settings.get("claude_weekly_budget", 0) or 0)
-        if budget > 0:
-            used = min(1.0, week / float(budget))
-            weekly = spec("%d%%" % round(used * 100), None, fill="sunken", fg="fg",
-                          size=21, gloss=False, sub=compact(week), gauge=used,
-                          bar=("green" if used < 0.6 else
-                               "yellow" if used < 0.85 else "red"),
-                          track="darker_background")
-            left = max(0, budget - week)
-            share = left / float(budget)
-            remaining = spec(compact(left), None, fill="sunken", fg="fg",
-                             size=21, gloss=False, sub="left", gauge=share,
-                             bar=("green" if share > 0.4 else
-                                  "yellow" if share > 0.15 else "red"),
-                             track="darker_background")
+        # Claude Code caches the real buckets, so the local token budget is now
+        # only a fallback for when no model-scoped weekly limit is reported.
+        scoped = self.limits.scoped_kind()
+        scoped_name = (self.limits.get(scoped) or {}).get("model") or "model"
+        if scoped:
+            third = self.limit_tile(scoped, scoped_name.lower())
         else:
-            # Anthropic publishes no weekly allowance on disk - /usage fetches it
-            # live - so without a budget to measure against, report the rolling
-            # seven days and say plainly that nothing caps it.
-            weekly = spec(compact(week), None, fill="sunken", fg="yellow",
-                          size=21, gloss=False, sub="week")
-            remaining = spec("\u221e", None, fill="sunken", fg="muted",
-                             size=25, gloss=False, sub="no cap")
+            week = self.totals.week()
+            budget = int(settings.get("claude_weekly_budget", 0) or 0)
+            if budget > 0:
+                used = min(1.0, week / float(budget))
+                third = spec("%d%%" % round((1 - used) * 100), None, fill="sunken",
+                             fg="fg", size=21, gloss=False, sub="left", gauge=1 - used,
+                             bar=("green" if used < 0.6 else
+                                  "yellow" if used < 0.85 else "red"),
+                             track="darker_background")
+            else:
+                third = spec(compact(week), None, fill="sunken", fg="yellow",
+                             size=21, gloss=False, sub="week")
 
         tiles = [
             lead,
+            self.limit_tile("session", "session"),
+            self.limit_tile("weekly_all", "week"),
+            third,
             context,
-            spec(compact(session.output), None, fill="sunken", fg="magenta",
-                 size=21, gloss=False, sub="output"),
-            weekly,
-            remaining,
         ]
         # The whole read-out is one big button: tap anywhere to expand it.
         for tile in tiles:
@@ -1151,9 +1250,6 @@ class TouchBar:
                         gloss=False, sub=caption, daemon="page:claude")
 
         top = sorted(session.tools.items(), key=lambda kv: kv[1], reverse=True)[:3]
-        limit = int(self.config["settings"].get("claude_context_limit", 0) or 0)
-        if limit <= 0:
-            limit = 1_000_000 if session.context > 190_000 else 200_000
         model = re.sub(r"^claude-", "", session.model or "").replace("-", " ")
         rows = [
             tile(session.name or "session", "name", "accent"),
@@ -1164,10 +1260,12 @@ class TouchBar:
             tile(session.elapsed() or "-", "elapsed", "blue"),
         ]
         rows += [tile(count, name.lower()[:8], "fg") for name, count in top]
+        # Context and the rate-limit gauges live on the main bar; this page
+        # carries what could not fit beside them.
         rows += [
-            tile(compact(session.context), "context", "fg"),
-            tile(compact(limit), "window", "muted"),
+            tile(compact(session.output), "output", "magenta"),
             tile(compact(session.cache_read), "cached", "magenta"),
+            tile(compact(self.totals.total), "all time", "cyan"),
             tile(plan_tier() or "-", "plan", "cyan"),
         ]
         return self.compose([rows], [close])
