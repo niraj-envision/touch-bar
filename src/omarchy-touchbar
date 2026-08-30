@@ -219,6 +219,8 @@ def compact(n):
 
 
 def stamp_to_epoch(stamp):
+    if isinstance(stamp, (int, float)):
+        return float(stamp)
     try:
         return calendar.timegm(time.strptime((stamp or "")[:19], "%Y-%m-%dT%H:%M:%S"))
     except (ValueError, TypeError):
@@ -947,7 +949,7 @@ class TouchBar:
             context_tile,
             spec(compact(data.get("output")), None, fill="sunken", fg="magenta",
                  size=21, gloss=False, sub="output"),
-            spec(data.get("turns", 0), None, fill="sunken", fg="blue",
+            spec(str(data.get("turns", 0)), None, fill="sunken", fg="blue",
                  size=21, gloss=False, sub="turns"),
             usage_tile,
         ]
@@ -1319,12 +1321,12 @@ class TouchBar:
         self.flush()
 
     def touch_settled(self):
-        return not self.touch_down and (
+        return not self.fn_down and not self.touch_down and (
             time.monotonic() - self.touch_released_at > TOUCH_GRACE
         )
 
     def flush(self):
-        """Write the queued layout once no finger is on the bar."""
+        """Write once no finger is down and Fn is not showing media controls."""
         with self.write_lock:
             if self.pending is None or not self.touch_settled():
                 return
@@ -1593,8 +1595,8 @@ def watch_hyprland(bar):
         time.sleep(1)                 # Hyprland restarted; reconnect
 
 
-def find_digitizer():
-    """The Touch Bar's own touch surface, so we can tell when a finger is down."""
+def find_input_device(name):
+    """Return the event node for an exact input-device name."""
     block = []
     for line in open("/proc/bus/input/devices"):
         if line.strip():
@@ -1602,11 +1604,48 @@ def find_digitizer():
             continue
         text = "".join(block)
         block = []
-        if DIGITIZER_NAME in text:
+        if 'N: Name="%s"' % name in text:
             match = re.search(r"Handlers=.*?(event\d+)", text)
             if match:
                 return "/dev/input/" + match.group(1)
     return None
+
+
+def find_digitizer():
+    """The Touch Bar's own touch surface, so we can tell when a finger is down."""
+    return find_input_device(DIGITIZER_NAME)
+
+
+def watch_fn(bar):
+    """Keep daemon repaints from dismissing tiny-dfr's Fn media layer.
+
+    tiny-dfr handles the physical Fn key itself. We only mirror its held state:
+    config reloads pause on key-down and the newest queued frame lands after
+    key-up. This preserves animations without making media buttons untappable.
+    """
+    path = find_input_device(KEYBOARD_NAME)
+    if not path:
+        sys.stderr.write("omarchy-touchbar: no internal keyboard; Fn is ungated\n")
+        return
+    while True:
+        try:
+            with open(path, "rb", buffering=0) as handle:
+                while True:
+                    data = handle.read(INPUT_EVENT.size)
+                    if not data or len(data) < INPUT_EVENT.size:
+                        break
+                    _, _, etype, code, value = INPUT_EVENT.unpack(data)
+                    if etype != EV_KEY or code != KEY_FN:
+                        continue
+                    if value == 1:
+                        bar.fn_down = True
+                    elif value == 0:
+                        bar.fn_down = False
+                        bar.touch_released_at = time.monotonic()
+                        bar.flush()
+        except OSError:
+            bar.fn_down = False
+        time.sleep(2)
 
 
 def watch_touches(bar):
@@ -1730,34 +1769,98 @@ def watch_voxtype(bar):
         time.sleep(0.08)
 
 
+CODEX_SESSION_CACHE = {}
+
+
+def codex_session_summary(path):
+    """Cache slow-changing, non-message session fields for five seconds."""
+    cached = CODEX_SESSION_CACHE.get(path)
+    if cached and time.monotonic() - cached[0] < 5:
+        return cached[1]
+    summary = {"model": "", "effort": "", "turns": 0,
+               "active_started": 0.0}
+    try:
+        with open(path, errors="replace") as handle:
+            for line in handle:
+                try:
+                    payload = json.loads(line).get("payload") or {}
+                except json.JSONDecodeError:
+                    continue
+                event_type = payload.get("type")
+                if event_type == "task_started":
+                    summary["turns"] += 1
+                    summary["active_started"] = stamp_to_epoch(
+                        payload.get("started_at"))
+                elif event_type in ("task_complete", "turn_aborted"):
+                    summary["active_started"] = 0.0
+                elif event_type == "thread_settings_applied":
+                    settings = payload.get("thread_settings") or {}
+                    summary["model"] = settings.get("model") or summary["model"]
+                    summary["effort"] = (settings.get("reasoning_effort") or
+                                         summary["effort"])
+    except OSError:
+        pass
+    CODEX_SESSION_CACHE[path] = (time.monotonic(), summary)
+    return summary
+
+
 def latest_codex_state():
-    """Read recent desktop rollouts. Multiple tasks can run concurrently, so
-    thinking means any recent task is active; usage is the newest real value."""
+    """Read numeric/state metadata from recent desktop rollouts.
+
+    Message text and tool arguments are deliberately ignored. The result feeds
+    the same kind of live status strip Claude Code gets: work state, context,
+    output, turns, tools, model, elapsed time, and real rate-limit gauges.
+    """
     paths = glob.glob(os.path.join(HOME, ".codex", "sessions", "**", "*.jsonl"),
                       recursive=True)
     if not paths:
-        return False, None
+        return {}
     now = time.time()
     paths = sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True)[:16]
-    active = False
-    usage = None
-    usage_mtime = -1
+    newest = None
+    active_tasks = 0
+    rate = {"usage": None, "secondary_usage": None, "mtime": -1}
     for path in paths:
         mtime = os.path.getmtime(path)
         if now - mtime > 1800:
             continue
         try:
             with open(path, "rb") as handle:
+                # Ignore guardian/reviewer/subagent rollouts. Their tiny,
+                # short-lived model names made the desktop panel jump away
+                # from the user's actual ChatGPT/Codex task.
+                prefix = handle.read(32768).decode(errors="replace")
+                metadata = {}
+                for line in prefix.splitlines():
+                    try:
+                        candidate = json.loads(line).get("payload") or {}
+                    except json.JSONDecodeError:
+                        continue
+                    if candidate.get("session_id"):
+                        metadata = candidate
+                        break
+                source = metadata.get("source")
+                if metadata.get("parent_thread_id") or \
+                        metadata.get("thread_source") or isinstance(source, dict):
+                    continue
                 handle.seek(0, os.SEEK_END)
                 end = handle.tell()
                 handle.seek(max(0, end - 262144))
                 raw = handle.read().decode(errors="replace")
         except OSError:
             continue
+        static = codex_session_summary(path)
+        detail = {
+            "model": static["model"], "effort": static["effort"],
+            "context": 0, "context_limit": 0,
+            "output": 0, "turns": static["turns"], "tools": 0, "tool": "",
+            "active_for": "-",
+        }
         events = []
+        started_at = static["active_started"]
         boundary_line = -1
         line_number = -1
-        file_usage = None
+        file_rate = {"usage": None, "secondary_usage": None}
         for line_number, line in enumerate(raw.splitlines()):
             try:
                 item = json.loads(line)
@@ -1768,10 +1871,33 @@ def latest_codex_state():
             if event_type in ("task_started", "task_complete", "turn_aborted"):
                 events.append(event_type)
                 boundary_line = line_number
+                if event_type == "task_started":
+                    started_at = stamp_to_epoch(payload.get("started_at"))
+                else:
+                    started_at = 0.0
+            if event_type == "thread_settings_applied":
+                settings = payload.get("thread_settings") or {}
+                detail["model"] = settings.get("model") or detail["model"]
+                detail["effort"] = (settings.get("reasoning_effort") or
+                                    detail["effort"])
+            if event_type in ("function_call", "custom_tool_call"):
+                detail["tools"] += 1
+                detail["tool"] = (payload.get("name") or "tool").split("__")[-1]
             if event_type == "token_count":
-                primary = ((payload.get("rate_limits") or {}).get("primary") or {})
+                info = payload.get("info") or {}
+                last = info.get("last_token_usage") or {}
+                total = info.get("total_token_usage") or {}
+                detail["context"] = int(last.get("total_tokens") or 0)
+                detail["context_limit"] = int(info.get("model_context_window") or 0)
+                detail["output"] = int(total.get("output_tokens") or 0)
+                limits = payload.get("rate_limits") or {}
+                primary = limits.get("primary") or {}
+                secondary = limits.get("secondary") or {}
                 if primary.get("used_percent") is not None:
-                    file_usage = int(round(primary["used_percent"]))
+                    file_rate["usage"] = int(round(primary["used_percent"]))
+                if secondary.get("used_percent") is not None:
+                    file_rate["secondary_usage"] = int(
+                        round(secondary["used_percent"]))
         file_active = bool(events) and events[-1] == "task_started"
         # A single tool-heavy turn can push task_started outside the 256 KiB
         # tail. Fresh reasoning/tool events after the last boundary still mean
@@ -1779,19 +1905,36 @@ def latest_codex_state():
         if now - mtime < 15:
             file_active = file_active or not events \
                 or (line_number - boundary_line > 3)
-        active = active or file_active
-        if file_usage is not None and mtime > usage_mtime:
-            usage, usage_mtime = file_usage, mtime
-    return active, usage
+        if file_active:
+            active_tasks += 1
+            if started_at:
+                seconds = max(0, int(now - started_at))
+                detail["active_for"] = ("%dm" % (seconds // 60)
+                                        if seconds >= 60 else "%ds" % seconds)
+        detail["thinking"] = file_active
+        if newest is None:
+            newest = detail
+        if any(value is not None for value in file_rate.values()) \
+                and mtime > rate["mtime"]:
+            rate.update(file_rate, mtime=mtime)
+
+    newest = newest or {}
+    newest["thinking"] = active_tasks > 0
+    newest["active_tasks"] = active_tasks
+    newest["usage"] = rate["usage"]
+    newest["secondary_usage"] = rate["secondary_usage"]
+    return newest
 
 
 def watch_chatgpt(bar):
-    """Animate from actual Codex task events and show real usage."""
-    previous = (None, None)
+    """Animate from actual Codex task events and show real telemetry."""
+    previous = None
     while True:
         current = latest_codex_state()
         if current != previous:
-            bar.chatgpt_thinking, bar.chatgpt_usage = current
+            bar.chatgpt_stats = current
+            bar.chatgpt_thinking = bool(current.get("thinking"))
+            bar.chatgpt_usage = current.get("usage")
             previous = current
             active = bar.active_window()
             if re.search(r"^(chatgpt|ChatGPT)$", active.get("class", "")):
@@ -1871,6 +2014,7 @@ def run_daemon():
 
     signal.signal(signal.SIGTERM, bye)
     signal.signal(signal.SIGINT, bye)
+    threading.Thread(target=watch_fn, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_touches, args=(bar,), daemon=True).start()
     threading.Thread(target=drain, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_voxtype, args=(bar,), daemon=True).start()

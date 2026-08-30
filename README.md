@@ -11,12 +11,15 @@ full-height, animated interface that follows the focused app.
 - App-aware layouts for terminals, Claude Code, ChatGPT, editors, Spotify,
   Discord, Obsidian, and general windows
 - Always-available dictation while typing, with recording/transcribing states
-- Native ChatGPT dictation when its accessible control is available
+- Native ChatGPT dictation plus Claude-style live model, context, output,
+  turns, tools, elapsed-time, task, and rate-limit telemetry
 - Claude Code read-out: live spinner with the running tool, context gauge,
   output, rolling 7-day and all-time token totals, expandable to full stats
 - Animated SVG buttons colored from the active Omarchy theme
 - Window launcher, media/function layer, app dock, and live battery/clock options
 - Touch-safe rendering that prevents `tiny-dfr` reloads while a finger is down
+- Fn-safe rendering that keeps classic brightness, keyboard-light, playback,
+  microphone, search, and volume controls usable for the full key hold
 
 ## Requirements
 
@@ -100,4 +103,3 @@ SVG controls and writes a stable 13-button layout to `tiny-dfr`.
 Workspace, microphone, page, and app-dock controls are dispatched from the raw
 touch surface. They do not use synthetic F-keys, which prevents workspace taps
 from accidentally toggling dictation.
-
