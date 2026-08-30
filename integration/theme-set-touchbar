@@ -1,0 +1,3 @@
+#!/bin/bash
+# Repaint the Touch Bar in the new theme's colours.
+exec "$HOME/.local/bin/omarchy-touchbar" render

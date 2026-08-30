@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+user_bin="${HOME}/.local/bin"
+omarchy_config="${HOME}/.config/omarchy"
+hypr_config="${HOME}/.config/hypr"
+force_config=false
+
+if [[ "${1:-}" == "--force-config" ]]; then
+  force_config=true
+elif [[ $# -gt 0 ]]; then
+  echo "Usage: ./install.sh [--force-config]" >&2
+  exit 2
+fi
+
+for command in python3 hyprctl systemctl systemd-run wtype rsvg-convert; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "Missing required command: $command" >&2
+    exit 1
+  fi
+done
+
+if ! command -v tiny-dfr >/dev/null 2>&1; then
+  echo "Missing tiny-dfr. Install it before running this installer." >&2
+  exit 1
+fi
+
+install -d "$user_bin" "$omarchy_config" "$omarchy_config/hooks/theme-set.d" "$hypr_config"
+install -m 0755 "$project_dir/src/omarchy-touchbar" "$user_bin/omarchy-touchbar"
+install -m 0755 "$project_dir/src/omarchy-chatgpt-dictate" "$user_bin/omarchy-chatgpt-dictate"
+install -m 0755 "$project_dir/integration/theme-set-touchbar" \
+  "$omarchy_config/hooks/theme-set.d/touchbar"
+
+if $force_config || [[ ! -e "$omarchy_config/touchbar.toml" ]]; then
+  install -m 0644 "$project_dir/config/touchbar.toml" "$omarchy_config/touchbar.toml"
+else
+  install -m 0644 "$project_dir/config/touchbar.toml" "$omarchy_config/touchbar.toml.dist"
+  echo "Kept existing touchbar.toml; repository version installed as touchbar.toml.dist."
+fi
+
+autostart="$hypr_config/autostart.lua"
+touch "$autostart"
+if ! grep -Fq 'omarchy-touchbar daemon' "$autostart"; then
+  printf '\n-- Context-aware T2 MacBook Touch Bar.\n' >> "$autostart"
+  printf 'o.launch_on_start(os.getenv("HOME") .. "/.local/bin/omarchy-touchbar daemon")\n' >> "$autostart"
+fi
+
+bindings="$hypr_config/bindings.lua"
+touch "$bindings"
+if ! grep -Fq 'Touch Bar daemon-owned controls' "$bindings"; then
+  cat >> "$bindings" <<'LUA'
+
+-- Touch Bar daemon-owned controls use the raw touch surface, not F-keys.
+for key = 13, 24 do
+  hl.unbind("F" .. tostring(key))
+end
+LUA
+fi
+
+codex_flags="${HOME}/.config/codex-flags.conf"
+touch "$codex_flags"
+if ! grep -Fxq -- '--force-renderer-accessibility' "$codex_flags"; then
+  printf '\n# Let the Touch Bar activate ChatGPT/Codex native dictation.\n' >> "$codex_flags"
+  printf '%s\n' '--force-renderer-accessibility' >> "$codex_flags"
+fi
+
+if [[ ! -d /etc/tiny-dfr || ! -w /etc/tiny-dfr ]]; then
+  echo "Preparing /etc/tiny-dfr for live user-level rendering (sudo required)."
+  sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" /etc/tiny-dfr /etc/tiny-dfr/gen
+  sudo touch /etc/tiny-dfr/config.toml
+  sudo chown "$(id -un):$(id -gn)" /etc/tiny-dfr/config.toml
+fi
+
+python3 -m py_compile "$user_bin/omarchy-touchbar" "$user_bin/omarchy-chatgpt-dictate"
+python3 -c 'import tomllib, pathlib; tomllib.loads(pathlib.Path.home().joinpath(".config/omarchy/touchbar.toml").read_text())'
+
+systemctl --user stop omarchy-touchbar.service 2>/dev/null || true
+systemd-run --user --unit=omarchy-touchbar --collect "$user_bin/omarchy-touchbar" daemon >/dev/null
+sudo systemctl restart tiny-dfr
+hyprctl reload >/dev/null
+
+echo "Omarchy Touch Bar installed and running."
+echo "Run: omarchy-touchbar status"
+

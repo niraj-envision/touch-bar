@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Activate ChatGPT's own Dictate control through AT-SPI.
+
+Exit 1 when the control is unavailable so omarchy-touchbar can fall back to
+Voxtype. ChatGPT needs --force-renderer-accessibility on Linux; that flag is
+configured in ~/.config/codex-flags.conf and applies on the next app launch.
+"""
+
+import sys
+
+import gi
+
+gi.require_version("Atspi", "2.0")
+from gi.repository import Atspi  # noqa: E402
+
+
+def walk(root, limit=5000):
+    queue = [root]
+    seen = 0
+    while queue and seen < limit:
+        item = queue.pop(0)
+        seen += 1
+        yield item
+        try:
+            queue.extend(item.get_child_at_index(i)
+                         for i in range(item.get_child_count()))
+        except Exception:
+            pass
+
+
+desktop = Atspi.get_desktop(0)
+candidates = []
+for app in walk(desktop, 40):
+    try:
+        if app.get_name().lower() in ("chatgpt", "codex"):
+            candidates.append(app)
+    except Exception:
+        pass
+
+needles = ("dictate", "dictation", "microphone", "voice input")
+for app in candidates:
+    for item in walk(app):
+        try:
+            text = "%s %s" % (item.get_name() or "", item.get_description() or "")
+            if not any(word in text.lower() for word in needles):
+                continue
+            action = item.get_action_iface()
+            if not action:
+                continue
+            for index in range(action.get_n_actions()):
+                name = (action.get_action_name(index) or "").lower()
+                if name in ("click", "press", "activate", "default"):
+                    sys.exit(0 if action.do_action(index) else 1)
+            if action.get_n_actions():
+                sys.exit(0 if action.do_action(0) else 1)
+        except Exception:
+            continue
+sys.exit(1)

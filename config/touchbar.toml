@@ -1,0 +1,197 @@
+# omarchy-touchbar - what your Touch Bar shows.
+#
+# Reloads the moment you save this file. Every button is drawn as an SVG pill
+# using the colours of your current Omarchy theme, so switching themes restyles
+# the bar. Labels are plain text: any glyph from JetBrainsMono Nerd Font works
+# (https://www.nerdfonts.com/cheat-sheet). `keys` is a chord sent to the focused
+# window, e.g. "CTRL+SHIFT+Tab", "SUPER+Return", "ALT+Left", or a raw key name
+# like "PlayPause".
+#
+# `color` and `background` accept a theme role - surface, sunken, raised,
+# accent, on_accent, fg, muted - or any colour name from the theme's
+# colors.toml (red, green, yellow, blue, magenta, cyan, orange), or a #hex.
+#
+#   omarchy-touchbar page next     smart bar <-> F1-F12
+#   omarchy-touchbar preview       render a PNG mock-up of the bar
+# Hold fn at any time for the media keys (brightness, volume, playback).
+
+[settings]
+font = "JetBrainsMono Nerd Font"
+slots = 13                  # buttons besides the esc key tiny-dfr adds itself
+corner_radius = 13
+animate = true              # buttons pop when their contents change
+claude_spinner = 0.32       # seconds per spinner frame while Claude works
+claude_context_limit = 0    # 0 = infer 200k vs 1M from the transcript
+# Anthropic does not publish your weekly allowance anywhere on disk, so the
+# week tile shows the last 7 days of tokens. Set a token budget here and it
+# becomes a percentage gauge instead.
+claude_weekly_budget = 0
+
+workspaces = 5              # workspace buttons, when a profile shows them
+max_workspaces = 5
+windows = 4                 # "jump to window" buttons, most-recent first
+
+adaptive_brightness = true
+active_brightness = 128
+clock = ""                  # e.g. "%H:%M" to show a clock
+battery = ""                # "percentage", "icon" or "both"
+
+# Glyphs for the window buttons: [glyph, colour], matched on window class in order.
+[icons]
+"^(zen|firefox|librewolf)" = ["", "yellow"]
+"^(chrom|Chrom|brave|google-chrome|Google-chrome)" = ["", "blue"]
+"(Alacritty|kitty|ghostty|foot|wezterm|^org\\.omarchy\\.|^TUI\\.)" = ["", "green"]
+"^[Ss]potify" = ["", "green"]
+"^obsidian" = ["", "magenta"]
+"^discord" = ["", "blue"]
+"[Nn]autilus|[Tt]hunar|[Nn]emo" = ["", "yellow"]
+"^(code|Code|VSCodium)" = ["", "cyan"]
+"^(steam|Steam)" = ["", "muted"]
+"^(chatgpt|ChatGPT)$" = ["󰭹", "green"]
+
+# ---------------------------------------------------------------- profiles --
+# The first profile whose `match` hits the focused window's class wins.
+#
+#   collapse_workspaces  fold the workspace switcher into one pill that opens
+#                        a full-width picker, freeing slots for the app
+#   tabs                 N numbered buttons wired to CTRL+1..CTRL+N
+#   windows              cap on "jump to window" buttons (0 to drop them)
+
+[[profiles]]
+name = "Browser"
+match_tag = "browser$"
+match = "^(zen|zen-.*|chrome-.*|chromium|Chromium|brave-browser|firefox|librewolf|google-chrome|Google-chrome)"
+icon = ""
+icon_color = "yellow"
+collapse_workspaces = true
+tabs = 4
+tab_icons = ["󰊯", "", "", ""]
+tab_colors = ["cyan", "red", "yellow", "blue"]
+windows = 0
+show_identity = false
+buttons = [
+  { label = "󰁍", keys = "ALT+Left",       hint = "Back" },
+  { label = "󰁔", keys = "ALT+Right",      hint = "Forward" },
+  { label = "",  keys = "CTRL+Tab",       hint = "Next tab" },
+  { label = "",  keys = "CTRL+T",   color = "green", hint = "New tab" },
+  { label = "",  keys = "CTRL+W",   color = "red",   hint = "Close tab" },
+  { label = "",  keys = "CTRL+R",                    hint = "Reload" },
+]
+
+[[profiles]]
+name = "Claude Code"
+# Detected by finding a `claude` process under the focused window, so it works
+# in any terminal. The title match is only a fallback.
+claude = true
+match_title = "^✳"
+voice_backend = "claude"
+icon = "󰚩"
+icon_color = "orange"
+collapse_workspaces = true
+show_identity = false       # the live status tile is the identity
+# Five live tiles are prepended to these: status, context, output, turns, tools.
+buttons = [
+  { label = "{mode}", keys = "SHIFT+Tab", size = 18, background = "raised", hint = "Cycle permission mode" },
+  { label = "/",      keys = "Slash",     size = 27, hint = "Slash commands" },
+  { label = "@",      keys = "SHIFT+2",   size = 25, hint = "Mention a file" },
+  { label = "!",      keys = "SHIFT+1",   size = 27, color = "green", hint = "Bash mode" },
+  { label = "󰅃", keys = "Up",  size = 26, hint = "Previous prompt" },
+]
+
+[[profiles]]
+name = "Terminal"
+match_tag = "^terminal$"
+match = "(Alacritty|kitty|com\\.mitchellh\\.ghostty|foot|org\\.codeberg\\.dnkl\\.foot|wezterm|^org\\.omarchy\\.|^TUI\\.)"
+icon = ""
+icon_color = "green"
+buttons = [
+  { label = "",  keys = "SUPER+Return", color = "green", hint = "New terminal" },
+  { label = "",  keys = "SUPER+C",      hint = "Copy" },
+  { label = "",  keys = "SUPER+V",      hint = "Paste" },
+  { label = "",  keys = "SUPER+J",      hint = "Toggle split" },
+  { label = "󰊓", keys = "SUPER+F",      hint = "Full screen" },
+  { label = "",  keys = "SUPER+W",      color = "red", hint = "Close window" },
+]
+
+[[profiles]]
+name = "Obsidian"
+match = "^obsidian"
+icon = ""
+icon_color = "magenta"
+buttons = [
+  { label = "",  keys = "CTRL+SHIFT+F", hint = "Search vault" },
+  { label = "",  keys = "CTRL+O",       hint = "Quick switcher" },
+  { label = "",  keys = "CTRL+N",       color = "green", hint = "New note" },
+  { label = "",  keys = "CTRL+P",       hint = "Command palette" },
+  { label = "󰊓", keys = "SUPER+F",      hint = "Full screen" },
+]
+
+[[profiles]]
+name = "Spotify"
+match = "^[Ss]potify"
+icon = ""
+icon_color = "green"
+buttons = [
+  { label = "",  keys = "PreviousSong", hint = "Previous" },
+  { label = "",  keys = "PlayPause",    color = "green", hint = "Play/pause" },
+  { label = "",  keys = "NextSong",     hint = "Next" },
+  { label = "",  keys = "CTRL+L",       hint = "Search" },
+]
+
+[[profiles]]
+name = "Discord"
+match = "^discord"
+icon = ""
+icon_color = "blue"
+buttons = [
+  { label = "",  keys = "CTRL+SHIFT+M", color = "red", hint = "Mute" },
+  { label = "",  keys = "CTRL+SHIFT+D", color = "red", hint = "Deafen" },
+  { label = "",  keys = "ALT+SHIFT+Up",   hint = "Previous unread" },
+  { label = "",  keys = "ALT+SHIFT+Down", hint = "Next unread" },
+]
+
+[[profiles]]
+name = "ChatGPT"
+match = "^(chatgpt|ChatGPT)$"
+voice_backend = "chatgpt"
+show_identity = false
+icon = "󰭹"
+icon_color = "green"
+collapse_workspaces = true
+buttons = [
+  { label = "", keys = "CTRL+SHIFT+O", color = "green", hint = "New chat" },
+  { label = "", keys = "CTRL+K",       hint = "Search chats" },
+  { label = "", keys = "CTRL+C",       hint = "Copy" },
+  { label = "", keys = "CTRL+V",       hint = "Paste" },
+  { label = "", keys = "PAGEUP",        hint = "Earlier messages" },
+  { label = "", keys = "PAGEDOWN",      hint = "Later messages" },
+  { label = "󰊓", keys = "SUPER+F",      hint = "Full screen" },
+  { label = "", keys = "SUPER+W",       color = "red", hint = "Close window" },
+]
+
+[[profiles]]
+name = "Editor"
+match = "^(code|Code|VSCodium|zed|Zed)$"
+icon = ""
+icon_color = "cyan"
+collapse_workspaces = true
+buttons = [
+  { label = "", keys = "CTRL+P",       hint = "Quick open" },
+  { label = "", keys = "CTRL+SHIFT+P", hint = "Command palette" },
+  { label = "", keys = "CTRL+GRAVE",   hint = "Terminal" },
+  { label = "󰊢", keys = "CTRL+SHIFT+G", color = "orange", hint = "Source control" },
+  { label = "󰊓", keys = "SUPER+F",      hint = "Full screen" },
+]
+
+[[profiles]]
+name = "Windows"
+default = true
+icon = "󰀻"
+icon_color = "accent"
+buttons = [
+  { label = "",  keys = "SUPER+Space",  color = "accent", hint = "Launcher" },
+  { label = "󰊓", keys = "SUPER+F",      hint = "Full screen" },
+  { label = "",  keys = "SUPER+T",      hint = "Float/tile" },
+  { label = "",  keys = "SUPER+J",      hint = "Toggle split" },
+  { label = "",  keys = "SUPER+W",      color = "red", hint = "Close window" },
+]
