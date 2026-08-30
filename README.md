@@ -15,7 +15,7 @@ full-height, animated interface that follows the focused app.
   turns, tools, elapsed-time, task, and rate-limit telemetry
 - Claude Code read-out: live spinner with the running tool, real session/weekly/
   model rate-limit gauges with reset countdowns, context gauge, expandable to
-  full session stats
+  full session stats, with model and effort switchable from the panel
 - Animated SVG buttons colored from the active Omarchy theme
 - Window launcher, media/function layer, app dock, and live battery/clock options
 - Touch-safe rendering that prevents `tiny-dfr` reloads while a finger is down
@@ -75,9 +75,15 @@ a live read-out of that session. Everything is read from
 which Claude Code writes as it goes — no hooks and no changes to
 `~/.claude/settings.json`.
 
-Tapping any read-out tile expands it into a full stats page: session name,
-model, permission mode, turns, elapsed, top tools, context, window, cached
+Tapping any read-out tile expands it into a full stats page: model, effort,
+permission mode, turns, elapsed, top tools, output, cached tokens, all-time
 tokens, and plan tier.
+
+On that page the **model** and **effort** tiles are doors — tap one to pick from
+`opus / sonnet / haiku / fable` or `auto / low / medium / high / xhigh`. The
+choice is applied by typing the matching `/model` or `/effort` command into the
+prompt, so it is only offered while the session is idle; during a turn the
+options render greyed out and do nothing.
 
 ### Rate limits
 

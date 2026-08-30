@@ -200,6 +200,11 @@ class Palette:
 # Quadrant circles rather than braille dots: at 30px a braille frame reads as
 # a few specks, while these are legible even as a still frame.
 SPINNER = "\u25d0\u25d3\u25d1\u25d2"
+# `claude --model` takes these aliases; /effort takes these levels (the binary
+# also knows "ultracode", which is deliberately left out of a one-tap control).
+MODEL_CHOICES = ("opus", "sonnet", "haiku", "fable")
+EFFORT_CHOICES = ("auto", "low", "medium", "high", "xhigh")
+
 PERMISSION_LABELS = {
     "auto": "auto", "default": "ask", "normal": "ask", "plan": "plan",
     "acceptEdits": "edits", "bypassPermissions": "bypass",
@@ -446,6 +451,7 @@ class ClaudeSession:
         self.state = self.IDLE
         self.tool = ""
         self.model = ""
+        self.effort = ""
         self.reported = ""
         self.name = ""
 
@@ -491,6 +497,7 @@ class ClaudeSession:
             self.last_ts = stamp
         message = record.get("message") or {}
         self.model = message.get("model") or self.model
+        self.effort = record.get("effort") or self.effort
         usage = message.get("usage") or {}
         if usage:
             self.output += usage.get("output_tokens", 0)
@@ -1252,8 +1259,10 @@ class TouchBar:
         top = sorted(session.tools.items(), key=lambda kv: kv[1], reverse=True)[:3]
         model = re.sub(r"^claude-", "", session.model or "").replace("-", " ")
         rows = [
-            tile(session.name or "session", "name", "accent"),
-            tile(model or "-", "model", "accent"),
+            spec(model or "-", None, fill="sunken", fg="accent", size=21,
+                 gloss=False, sub="model \u25be", daemon="page:models"),
+            spec(session.effort or "auto", None, fill="sunken", fg="accent",
+                 size=21, gloss=False, sub="effort \u25be", daemon="page:efforts"),
             tile(PERMISSION_LABELS.get(session.permission, session.permission or "-"),
                  "mode", "green"),
             tile(session.turns, "turns", "blue"),
@@ -1312,6 +1321,38 @@ class TouchBar:
         ]
         return self.compose([rows], [close])
 
+    def choice_page(self, choices, current, kind):
+        """One tap per option. Switching drives a slash command through the
+        keyboard, so it is only offered while the session is idle."""
+        session = self.claude
+        idle = session is not None and not session.busy
+        close = spec("\uf00d", None, fill="sunken", fg="muted", size=24,
+                     daemon="page:%s" % kind)
+        rows = []
+        for choice in choices:
+            active = choice == current
+            rows.append(spec(
+                choice, None,
+                fill="accent" if active else "surface",
+                fg="on_accent" if active else ("fg" if idle else "muted"),
+                size=21, sub=kind[:-1] if active else "",
+                sub_fg="on_accent",
+                daemon=("%s:%s" % (kind[:-1], choice)) if idle and not active else None))
+        return self.compose([rows], [close])
+
+    def page_models(self):
+        current = ""
+        if self.claude and self.claude.model:
+            for alias in MODEL_CHOICES:
+                if alias in self.claude.model:
+                    current = alias
+                    break
+        return self.choice_page(MODEL_CHOICES, current, "models")
+
+    def page_efforts(self):
+        current = (self.claude.effort if self.claude else "") or "auto"
+        return self.choice_page(EFFORT_CHOICES, current, "efforts")
+
     def page_fn(self):
         rows = [spec("F%d" % n, "F%d" % n, fill="surface", fg="fg", size=22)
                 for n in range(1, 13)]
@@ -1326,6 +1367,10 @@ class TouchBar:
             return self.page_workspaces()
         if self.page == "claude":
             return self.page_claude()
+        if self.page == "models":
+            return self.page_models()
+        if self.page == "efforts":
+            return self.page_efforts()
         if self.page == "chatgpt":
             return self.page_chatgpt()
         return self.page_auto()
@@ -1516,11 +1561,33 @@ class TouchBar:
                 self.page = "auto" if self.page == value else value
             self.prev_specs = []  # no decorative transition on navigation UI
             self.render()
+        elif kind in ("model", "effort") and value:
+            self.run_slash("/%s %s" % (kind, value))
+            self.page = "auto"
+            self.prev_specs = []
+            self.render()
         elif kind == "voice":
             self.clear_dictation() if value == "clear" else self.toggle_voice()
         elif kind == "focus" and value:
             hypr('dispatch hl.dsp.focus({ window = "address:%s" })' % value,
                  as_json=False)
+
+    def run_slash(self, command):
+        """Type a slash command into the focused Claude Code prompt.
+
+        There is no IPC for this, so it goes through the keyboard. The prompt is
+        cleared first - the same Ctrl+A/BackSpace pair clear_dictation uses -
+        because a slash command only registers at the start of an empty line.
+        """
+        try:
+            subprocess.run(["wtype", "-M", "ctrl", "-k", "a", "-m", "ctrl",
+                            "-k", "BackSpace"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False)
+            subprocess.run(["wtype", command, "-k", "Return"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False)
+        except OSError as exc:
+            sys.stderr.write("omarchy-touchbar: cannot type %r: %s\n" % (command, exc))
 
     def send_key_state(self, key, state):
         hypr('dispatch hl.dsp.send_key_state({ key = "%s", state = "%s" })'
