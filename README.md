@@ -6,13 +6,14 @@ full-height, animated interface that follows the focused app.
 
 ## Highlights
 
-- Reliable raw-touch workspace picker for Omarchy workspaces 1–5
+- Raw-touch workspace picker showing each workspace's app, badged by number
 - Browser controls and tab shortcuts with a collapsed workspace drawer
 - App-aware layouts for terminals, Claude Code, ChatGPT, editors, Spotify,
   Discord, Obsidian, and general windows
 - Always-available dictation while typing, with recording/transcribing states
 - Native ChatGPT dictation when its accessible control is available
-- Claude-aware session activity, context, output, turn, and tool indicators
+- Claude Code read-out: live spinner with the running tool, context gauge,
+  output, rolling 7-day and all-time token totals, expandable to full stats
 - Animated SVG buttons colored from the active Omarchy theme
 - Window launcher, media/function layer, app dock, and live battery/clock options
 - Touch-safe rendering that prevents `tiny-dfr` reloads while a finger is down
@@ -61,6 +62,33 @@ omarchy-touchbar preview
 Edit `~/.config/omarchy/touchbar.toml` to tune profiles, icons, colors, buttons,
 workspace count, brightness, clock, battery, and animation settings. Saving it
 triggers a live repaint.
+
+## Claude Code
+
+When a `claude` process is running under the focused window, the bar switches to
+a live read-out of that session. Everything is read from
+`~/.claude/projects/<cwd>/<session>.jsonl` and `~/.claude/sessions/<pid>.json`,
+which Claude Code writes as it goes — no hooks and no changes to
+`~/.claude/settings.json`.
+
+Tapping any read-out tile expands it into a full stats page: session name,
+model, permission mode, turns, elapsed, top tools, context, window, cached
+tokens, and plan tier.
+
+### Weekly usage
+
+Anthropic does not publish your weekly allowance anywhere on disk — `/usage`
+fetches it from the API at runtime. The `week` tile therefore reports the last
+seven days of tokens counted from transcript timestamps, and `remaining` shows
+`∞ no cap` until you give it a number to measure against:
+
+```toml
+[settings]
+claude_weekly_budget = 500000000   # tokens; 0 disables the gauge
+```
+
+With a budget set, both tiles become percentage gauges that run green → yellow →
+red as the week fills up.
 
 ## Architecture
 

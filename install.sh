@@ -72,6 +72,15 @@ if [[ ! -d /etc/tiny-dfr || ! -w /etc/tiny-dfr ]]; then
   sudo chown "$(id -un):$(id -gn)" /etc/tiny-dfr/config.toml
 fi
 
+backlight_rule=/etc/udev/rules.d/99-touchbar-backlight.rules
+if [[ ! -e $backlight_rule ]]; then
+  echo "Allowing the session to hold the Touch Bar backlight on (sudo required)."
+  sudo install -m 0644 "$project_dir/integration/99-touchbar-backlight.rules" "$backlight_rule"
+  sudo udevadm control --reload-rules
+  sudo chgrp input /sys/class/backlight/appletb_backlight/brightness
+  sudo chmod g+w /sys/class/backlight/appletb_backlight/brightness
+fi
+
 python3 -m py_compile "$user_bin/omarchy-touchbar" "$user_bin/omarchy-chatgpt-dictate"
 python3 -c 'import tomllib, pathlib; tomllib.loads(pathlib.Path.home().joinpath(".config/omarchy/touchbar.toml").read_text())'
 

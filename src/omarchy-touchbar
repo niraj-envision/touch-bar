@@ -63,11 +63,14 @@ BUTTON_SPACING = 16
 # button list, and the stale index either panics it (it indexes unguarded at
 # main.rs:1047) or releases the wrong key. So: never write the config while a
 # finger is down, and always emit the same number of buttons.
+TOUCHBAR_BACKLIGHT = "/sys/class/backlight/appletb_backlight"
 DIGITIZER_NAME = "Apple Inc. Touch Bar Display Touchpad"
+KEYBOARD_NAME = "Apple Inc. Apple Internal Keyboard / Trackpad"
 INPUT_EVENT = struct.Struct("llHHi")
 EV_KEY = 0x01
 EV_ABS = 0x03
 BTN_TOUCH = 0x14A
+KEY_FN = 0x1D0
 ABS_X = 0x00
 ABS_MT_POSITION_X = 0x35
 TOUCH_GRACE = 0.05
@@ -668,11 +671,15 @@ class TouchBar:
         self.last_touch = None
         self.touch_down = False
         self.touch_released_at = 0.0
+        # A config write resets tiny-dfr to its primary layer. Hold every
+        # repaint while the physical Fn key exposes the classic media layer.
+        self.fn_down = False
         self.voice_state = "idle"
         self.voice_backend = None
         self.voice_target = None
         self.voice_phase = 0
         self.review_until = 0.0
+        self.chatgpt_stats = {}
         self.chatgpt_thinking = False
         self.chatgpt_usage = None
         self.chatgpt_phase = 0
@@ -798,18 +805,26 @@ class TouchBar:
     # -- groups -----------------------------------------------------------
     def workspace_group(self, workspaces, active_ws, collapsed):
         current = active_ws.get("id")
+        ids = self.workspace_ids(workspaces)
+        populated = {w.get("id"): w.get("windows", 0) for w in workspaces}
         if collapsed:
-            # Folded into one pill so the app keeps the width; tap opens the picker.
+            # Folded into one pill so the app keeps the width; tap opens the
+            # picker. The dot row still shows where you are at a glance.
+            dots = "".join("\u25cf" if index == current else "\u25cb"
+                           for index in ids)
             return [spec(str(current or 1), None, fill="accent", fg="on_accent",
-                         size=30, daemon="page:workspaces")]
+                         size=27, sub=dots, sub_fg="on_accent", sub_size=12,
+                         daemon="page:workspaces")]
         rows = []
-        for index in self.workspace_ids(workspaces):
+        for index in ids:
             active = index == current
+            windows = populated.get(index, 0)
             rows.append(spec(
                 str(index), None,
                 fill="accent" if active else "surface",
-                fg="on_accent" if active else "muted",
-                size=27, daemon="workspace:%d" % index,
+                fg="on_accent" if active else ("fg" if windows else "muted"),
+                size=27, badge=(windows or None),
+                daemon="workspace:%d" % index,
             ))
         return rows
 
@@ -822,11 +837,12 @@ class TouchBar:
         if session.busy:
             frame = SPINNER[self.claude_phase % len(SPINNER)]
             caption = (session.tool or "thinking").lower()[:9]
-            status = spec(frame, None, fill="accent", fg="on_accent",
-                          size=30, glow=True, sub=caption, sub_fg="on_accent")
+            lead = spec(frame, None, fill="accent", fg="on_accent",
+                        size=30, glow=True, sub=caption, sub_fg="on_accent")
         else:
-            status = spec("\uf0e7", None, fill="sunken", fg="green",
-                          size=26, sub="ready", sub_fg="green")
+            # Nothing to say while it waits for you, so the slot earns its keep.
+            lead = spec(compact(self.totals.total), None, fill="sunken",
+                        fg="cyan", size=21, gloss=False, sub="all time")
 
         limit = int(settings.get("claude_context_limit", 0) or 0)
         if limit <= 0:
@@ -842,26 +858,35 @@ class TouchBar:
         week = self.totals.week()
         budget = int(settings.get("claude_weekly_budget", 0) or 0)
         if budget > 0:
-            share = min(1.0, week / float(budget))
-            weekly = spec("%d%%" % round(share * 100), None, fill="sunken", fg="fg",
-                          size=21, gloss=False, sub=compact(week), gauge=share,
-                          bar=("green" if share < 0.6 else
-                               "yellow" if share < 0.85 else "red"),
+            used = min(1.0, week / float(budget))
+            weekly = spec("%d%%" % round(used * 100), None, fill="sunken", fg="fg",
+                          size=21, gloss=False, sub=compact(week), gauge=used,
+                          bar=("green" if used < 0.6 else
+                               "yellow" if used < 0.85 else "red"),
                           track="darker_background")
+            left = max(0, budget - week)
+            share = left / float(budget)
+            remaining = spec(compact(left), None, fill="sunken", fg="fg",
+                             size=21, gloss=False, sub="left", gauge=share,
+                             bar=("green" if share > 0.4 else
+                                  "yellow" if share > 0.15 else "red"),
+                             track="darker_background")
         else:
-            # No weekly allowance is published locally, so without a budget to
-            # measure against this is simply the last seven days of tokens.
+            # Anthropic publishes no weekly allowance on disk - /usage fetches it
+            # live - so without a budget to measure against, report the rolling
+            # seven days and say plainly that nothing caps it.
             weekly = spec(compact(week), None, fill="sunken", fg="yellow",
                           size=21, gloss=False, sub="week")
+            remaining = spec("\u221e", None, fill="sunken", fg="muted",
+                             size=25, gloss=False, sub="no cap")
 
         tiles = [
-            status,
+            lead,
             context,
             spec(compact(session.output), None, fill="sunken", fg="magenta",
                  size=21, gloss=False, sub="output"),
             weekly,
-            spec(compact(self.totals.total), None, fill="sunken", fg="cyan",
-                 size=21, gloss=False, sub="all time"),
+            remaining,
         ]
         # The whole read-out is one big button: tap anywhere to expand it.
         for tile in tiles:
@@ -881,21 +906,54 @@ class TouchBar:
         if profile.get("claude"):
             return self.claude_tiles(self.claude) + rows
         if profile.get("name") == "ChatGPT":
-            phases = ("󰔟", "󰔚", "󰔛", "󰔜")
-            label = phases[self.chatgpt_phase % len(phases)] \
-                if self.chatgpt_thinking else "󰭹"
-            smart = spec(label, None,
-                         fill="accent" if self.chatgpt_thinking else "sunken",
-                         fg="on_accent" if self.chatgpt_thinking else "green",
-                         size=28, glow=self.chatgpt_thinking)
-            if self.chatgpt_usage is None:
-                return [smart] + rows
-            usage_color = "green" if self.chatgpt_usage < 50 \
-                else "yellow" if self.chatgpt_usage < 80 else "red"
-            usage = spec("%d%%" % self.chatgpt_usage, None,
-                         fill="sunken", fg=usage_color, size=19, gloss=False)
-            return [smart] + rows + [usage]
+            return self.chatgpt_tiles() + rows
         return rows
+
+    def chatgpt_tiles(self):
+        """Claude-style live telemetry for the ChatGPT/Codex desktop app."""
+        data = self.chatgpt_stats
+        phases = ("󰔟", "󰔚", "󰔛", "󰔜")
+        label = phases[self.chatgpt_phase % len(phases)] \
+            if self.chatgpt_thinking else "󰭹"
+        caption = (data.get("tool") or
+                   ("thinking" if self.chatgpt_thinking else "ready"))[:9]
+        lead = spec(label, None,
+                    fill="accent" if self.chatgpt_thinking else "sunken",
+                    fg="on_accent" if self.chatgpt_thinking else "green",
+                    size=29, glow=self.chatgpt_thinking, sub=caption,
+                    sub_fg="on_accent" if self.chatgpt_thinking else "muted")
+
+        context = int(data.get("context") or 0)
+        limit = int(data.get("context_limit") or 0)
+        share = min(1.0, context / float(limit)) if limit else 0.0
+        context_color = "green" if share < 0.6 else "yellow" if share < 0.85 else "red"
+        context_tile = spec(
+            "%d%%" % round(share * 100) if limit else "--",
+            None, fill="sunken", fg="fg", size=21, gloss=False,
+            sub=compact(context), gauge=share, bar=context_color,
+            track="darker_background")
+
+        usage = data.get("usage")
+        usage_color = "green" if usage is None or usage < 50 \
+            else "yellow" if usage < 80 else "red"
+        usage_tile = spec(
+            "%d%%" % usage if usage is not None else "--",
+            None, fill="sunken", fg=usage_color, size=21, gloss=False,
+            sub="usage", gauge=(min(1.0, usage / 100.0) if usage is not None else 0),
+            bar=usage_color, track="darker_background")
+
+        tiles = [
+            lead,
+            context_tile,
+            spec(compact(data.get("output")), None, fill="sunken", fg="magenta",
+                 size=21, gloss=False, sub="output"),
+            spec(data.get("turns", 0), None, fill="sunken", fg="blue",
+                 size=21, gloss=False, sub="turns"),
+            usage_tile,
+        ]
+        for tile in tiles:
+            tile["daemon"] = "page:chatgpt"
+        return tiles
 
     def app_identity(self, profile, active_win):
         glyph = profile.get("icon")
@@ -1056,15 +1114,24 @@ class TouchBar:
         )
 
     def page_workspaces(self):
-        _, workspaces, active_ws, _ = self.snapshot()
+        clients, workspaces, active_ws, _ = self.snapshot()
         current = active_ws.get("id")
-        rows = [
-            spec(str(index), None,
-                 fill="accent" if index == current else "surface",
-                 fg="on_accent" if index == current else "fg", size=30,
-                 daemon="workspace:%d" % index)
-            for index in self.workspace_ids(workspaces)
-        ]
+        # Show what actually lives on each workspace rather than a bare digit:
+        # the glyph of its most recently focused window, numbered in the corner.
+        occupant = {}
+        for client in sorted(clients, key=lambda c: c.get("focusHistoryID", 999)):
+            occupant.setdefault((client.get("workspace") or {}).get("id"), client)
+        rows = []
+        for index in self.workspace_ids(workspaces):
+            top = occupant.get(index)
+            glyph, color = self.glyph_for(top) if top else ("\u00b7", "muted")
+            active = index == current
+            rows.append(spec(
+                glyph, None,
+                fill="accent" if active else "surface",
+                fg="on_accent" if active else color,
+                size=30, badge=index,
+                daemon="workspace:%d" % index))
         close = spec("", None, fill="sunken", fg="muted", size=24,
                      daemon="page:workspaces")
         return self.compose([rows], [close])
@@ -1103,6 +1170,48 @@ class TouchBar:
         ]
         return self.compose([rows], [close])
 
+    def page_chatgpt(self):
+        """Expanded ChatGPT/Codex activity panel, opened from any live tile."""
+        data = self.chatgpt_stats
+        close = spec("\uf00d", None, fill="sunken", fg="muted", size=24,
+                     daemon="page:chatgpt")
+
+        def tile(value, caption, color, gauge=None):
+            extra = {"daemon": "page:chatgpt"}
+            if gauge is not None:
+                extra.update(gauge=max(0.0, min(1.0, gauge)), bar=color,
+                             track="darker_background")
+            return spec(str(value), None, fill="sunken", fg=color, size=20,
+                        gloss=False, sub=caption, **extra)
+
+        context = int(data.get("context") or 0)
+        limit = int(data.get("context_limit") or 0)
+        usage = data.get("usage")
+        secondary = data.get("secondary_usage")
+        rows = [
+            tile("live" if self.chatgpt_thinking else "ready", "status",
+                 "green" if not self.chatgpt_thinking else "accent"),
+            tile(data.get("model") or "-", "model", "accent"),
+            tile(data.get("effort") or "-", "effort", "cyan"),
+            tile(compact(context), "context", "fg",
+                 context / float(limit) if limit else 0),
+            tile(compact(limit), "window", "muted"),
+            tile(compact(data.get("output")), "output", "magenta"),
+            tile(data.get("turns", 0), "turns", "blue"),
+            tile(data.get("tools", 0), "tools", "yellow"),
+            tile(data.get("active_for") or "-", "elapsed", "blue"),
+            tile("%d%%" % usage if usage is not None else "--", "5 hour",
+                 "green" if usage is None or usage < 50 else
+                 "yellow" if usage < 80 else "red",
+                 usage / 100.0 if usage is not None else 0),
+            tile("%d%%" % secondary if secondary is not None else "--", "weekly",
+                 "green" if secondary is None or secondary < 50 else
+                 "yellow" if secondary < 80 else "red",
+                 secondary / 100.0 if secondary is not None else 0),
+            tile(data.get("active_tasks", 0), "tasks", "cyan"),
+        ]
+        return self.compose([rows], [close])
+
     def page_fn(self):
         rows = [spec("F%d" % n, "F%d" % n, fill="surface", fg="fg", size=22)
                 for n in range(1, 13)]
@@ -1117,6 +1226,8 @@ class TouchBar:
             return self.page_workspaces()
         if self.page == "claude":
             return self.page_claude()
+        if self.page == "chatgpt":
+            return self.page_chatgpt()
         return self.page_auto()
 
     # -- output -----------------------------------------------------------
@@ -1240,8 +1351,8 @@ class TouchBar:
             if target == "next":
                 base = self.page if self.page in PAGES else "auto"
                 self.page = PAGES[(PAGES.index(base) + 1) % len(PAGES)]
-            elif target == "workspaces":
-                self.page = "auto" if self.page == "workspaces" else "workspaces"
+            elif target in ("workspaces", "claude", "chatgpt"):
+                self.page = "auto" if self.page == target else target
             elif target in PAGES:
                 self.page = target
             self.render()
@@ -1276,6 +1387,8 @@ class TouchBar:
                                "voice_backend": self.voice_backend,
                                "chatgpt_thinking": self.chatgpt_thinking,
                                "chatgpt_usage": self.chatgpt_usage,
+                               "chatgpt_stats": self.chatgpt_stats,
+                               "fn_down": self.fn_down,
                                "last_touch": self.last_touch})
         return "unknown command"
 
@@ -1299,7 +1412,7 @@ class TouchBar:
             if value == "next":
                 base = self.page if self.page in PAGES else "auto"
                 self.page = PAGES[(PAGES.index(base) + 1) % len(PAGES)]
-            elif value in ("workspaces", "claude"):
+            elif value in ("workspaces", "claude", "chatgpt"):
                 self.page = "auto" if self.page == value else value
             self.prev_specs = []  # no decorative transition on navigation UI
             self.render()
@@ -1546,6 +1659,42 @@ def watch_touches(bar):
         time.sleep(2)
 
 
+def keep_awake(bar):
+    """Hold the Touch Bar lit while something is actually happening.
+
+    tiny-dfr dims the panel 30 s after the last libinput event and blacks it out
+    at 60 s (BRIGHTNESS_DIM_TIMEOUT / BRIGHTNESS_OFF_TIMEOUT). Dictating a long
+    message or watching Claude work involves no input at all, so the bar goes
+    dark exactly when you are looking at it. tiny-dfr only writes the backlight
+    when its own computed value changes, so re-asserting full brightness here
+    sticks between its transitions.
+
+    Needs write access to the backlight attribute; without the udev rule from
+    install.sh this quietly does nothing.
+    """
+    try:
+        with open(os.path.join(TOUCHBAR_BACKLIGHT, "max_brightness")) as handle:
+            full = str(int(handle.read().strip()))
+    except (OSError, ValueError):
+        return
+    path = os.path.join(TOUCHBAR_BACKLIGHT, "brightness")
+    complained = False
+    while True:
+        busy = bar.voice_state in ("recording", "transcribing") \
+            or (bar.claude is not None and bar.claude.busy)
+        if busy:
+            try:
+                with open(path, "w") as handle:
+                    handle.write(full)
+            except OSError as exc:
+                if not complained:
+                    complained = True
+                    sys.stderr.write(
+                        "omarchy-touchbar: cannot hold the backlight on (%s); "
+                        "re-run install.sh to add the udev rule\n" % exc)
+        time.sleep(2)
+
+
 def drain(bar):
     """Write out layouts that were held back while the bar was being touched."""
     while True:
@@ -1728,6 +1877,7 @@ def run_daemon():
     threading.Thread(target=watch_chatgpt, args=(bar,), daemon=True).start()
     threading.Thread(target=animate_live_states, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_claude, args=(bar,), daemon=True).start()
+    threading.Thread(target=keep_awake, args=(bar,), daemon=True).start()
     threading.Thread(target=serve, args=(bar,), daemon=True).start()
     bar.render()
     watch_hyprland(bar)
