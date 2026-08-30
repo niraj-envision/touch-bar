@@ -257,6 +257,80 @@ def session_status(pid):
 
 CLAUDE_CONFIG = os.path.join(HOME, ".claude.json")
 
+# A four-bar equaliser. Block elements, so it needs no icon files.
+# Bar heights, 0..1, cycled to animate. Drawn as rects: block characters at
+# this size merge into one blob.
+EQUALIZER = ((0.25, 0.60, 1.00, 0.45),
+             (0.60, 1.00, 0.45, 0.25),
+             (1.00, 0.45, 0.25, 0.60),
+             (0.45, 0.25, 0.60, 1.00))
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+
+
+def run_quiet(args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+class MediaState:
+    """Whatever is playing, from MPRIS on the session bus.
+
+    playerctl is not installed here, so this talks to the bus directly through
+    busctl - the same interface playerctl would use.
+    """
+
+    def __init__(self):
+        self.player = ""
+        self.status = "Stopped"
+        self.title = ""
+        self.muted = False
+        self.checked = 0.0
+
+    def refresh(self, interval=1.5):
+        now = time.monotonic()
+        if now - self.checked < interval:
+            return
+        self.checked = now
+        names = [n for n in run_quiet(["busctl", "--user", "list", "--no-pager"]).split()
+                 if n.startswith("org.mpris.MediaPlayer2.")]
+        chosen, status = "", "Stopped"
+        for name in names:
+            state = self._property(name, "PlaybackStatus")
+            if state == "Playing":
+                chosen, status = name, state
+                break
+            if state == "Paused" and not chosen:
+                chosen, status = name, state
+        self.player, self.status = chosen, status
+        volume = run_quiet(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
+        self.muted = "MUTED" in volume
+
+    def _property(self, name, prop):
+        out = run_quiet(["busctl", "--user", "get-property", name, MPRIS_PATH,
+                         MPRIS_PLAYER, prop])
+        parts = out.strip().split('"')
+        return parts[1] if len(parts) > 1 else ""
+
+    @property
+    def active(self):
+        return bool(self.player) and self.status in ("Playing", "Paused")
+
+    @property
+    def playing(self):
+        return self.status == "Playing"
+
+    def call(self, method):
+        if self.player:
+            run_quiet(["busctl", "--user", "call", self.player, MPRIS_PATH,
+                       MPRIS_PLAYER, method])
+
+    def toggle_mute(self):
+        run_quiet(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+        self.checked = 0.0
+
 
 def until(iso):
     """'2026-09-06T15:00:00+00:00' -> '6d'. Empty when it has already passed."""
@@ -623,7 +697,22 @@ def build_svg(spec, width, radius, font, scale=1.0):
                 'font-weight="bold" fill="%s" text-anchor="middle">%s</text>'
                 % (width / 2, y, font, px, colour, body))
 
-    if gauge is not None:
+    bars = spec.get("bars")
+    if bars:
+        count = len(bars)
+        bar_w, gap = 7.0, 5.0
+        span = count * bar_w + (count - 1) * gap
+        left = (width - span) / 2.0
+        tallest = 34.0
+        body = ""
+        for index, height in enumerate(bars):
+            tall = max(5.0, tallest * float(height))
+            body += ('<rect x="%.2f" y="%.2f" width="%.2f" height="%.2f" rx="3" '
+                     'fill="%s"/>'
+                     % (left + index * (bar_w + gap),
+                        BAR_HEIGHT / 2 - tall / 2, bar_w, tall,
+                        spec.get("fg", "#d4be98")))
+    elif gauge is not None:
         pad, track_y, track_h = 16.0, 42.0, 8.0
         track_w = width - pad * 2
         filled = max(track_h, track_w * min(max(float(gauge), 0.0), 1.0))
@@ -782,6 +871,8 @@ class TouchBar:
         self.claude_probe = (None, 0.0, None)   # (window pid, checked at, claude pid)
         self.totals = ClaudeTotals()
         self.limits = UsageLimits()
+        self.media = MediaState()
+        self.media_phase = 0
 
     def _stamps(self):
         out = []
@@ -924,6 +1015,30 @@ class TouchBar:
             ))
         return rows
 
+    def media_group(self):
+        """Transport for whatever is playing, anywhere. Costs nothing when
+        silent, and displaces the typing shortcuts rather than the read-out."""
+        if not self.media.active:
+            return []
+        if self.media.playing:
+            lead = spec("", None, fill="accent", fg="on_accent",
+                        bars=EQUALIZER[self.media_phase % len(EQUALIZER)],
+                        daemon="media:playpause")
+        else:
+            lead = spec("\uf04b", None, fill="sunken", fg="green", size=24,
+                        daemon="media:playpause")
+        return [
+            spec("\uf048", None, fill="sunken", fg="fg", size=22,
+                 daemon="media:previous"),
+            lead,
+            spec("\uf051", None, fill="sunken", fg="fg", size=22,
+                 daemon="media:next"),
+            spec("\uf028", None, fill="sunken",
+                 fg="red" if self.media.muted else "fg", size=22,
+                 sub="muted" if self.media.muted else "", sub_fg="red",
+                 daemon="media:mute"),
+        ]
+
     def limit_tile(self, kind, caption):
         """Headroom left on one rate-limit bucket, with its reset countdown."""
         info = self.limits.get(kind)
@@ -937,10 +1052,9 @@ class TouchBar:
             color = "green" if left > 40 else "yellow" if left > 15 else "red"
         when = until(info.get("resets_at"))
         return spec("%d%%" % left, None, fill="sunken",
-                    fg="muted" if self.limits.stale() else "fg",
-                    size=21, gloss=False,
-                    sub="%s %s" % (caption, when) if when else caption,
-                    gauge=left / 100.0, bar=color, track="darker_background")
+                    fg="muted" if self.limits.stale() else color,
+                    size=27, gloss=False,
+                    sub="%s %s" % (caption, when) if when else caption)
 
     def claude_tiles(self, session):
         """Live session read-out: what it is doing, and what it has spent."""
@@ -954,9 +1068,11 @@ class TouchBar:
             lead = spec(frame, None, fill="accent", fg="on_accent",
                         size=30, glow=True, sub=caption, sub_fg="on_accent")
         else:
-            # Nothing to say while it waits for you, so the slot earns its keep.
-            lead = spec(compact(self.totals.total), None, fill="sunken",
-                        fg="cyan", size=21, gloss=False, sub="all time")
+            # Idle: name the model, and make it the shortcut for changing it.
+            short = re.sub(r"^claude-", "", session.model or "").replace("-", " ")
+            lead = spec(short or "claude", None, fill="sunken", fg="accent",
+                        size=21, gloss=False, sub="model \u25be",
+                        daemon="page:models")
 
         limit = int(settings.get("claude_context_limit", 0) or 0)
         if limit <= 0:
@@ -965,9 +1081,9 @@ class TouchBar:
             limit = 1_000_000 if session.context > 190_000 else 200_000
         used = min(1.0, session.context / float(limit))
         bar_color = "green" if used < 0.6 else "yellow" if used < 0.85 else "red"
-        context = spec("%d%%" % round(used * 100), None, fill="sunken", fg="fg",
-                       size=21, gloss=False, sub=compact(session.context),
-                       gauge=used, bar=bar_color, track="darker_background")
+        context = spec("%d%%" % round(used * 100), None, fill="sunken",
+                       fg=bar_color, size=27, gloss=False,
+                       sub="ctx %s" % compact(session.context))
 
         # Claude Code caches the real buckets, so the local token budget is now
         # only a fallback for when no model-scoped weekly limit is reported.
@@ -995,6 +1111,8 @@ class TouchBar:
             self.limit_tile("weekly_all", "week"),
             third,
             context,
+            spec(compact(self.totals.total), None, fill="sunken", fg="cyan",
+                 size=24, gloss=False, sub="lifetime"),
         ]
         # The whole read-out is one big button: tap anywhere to expand it.
         for tile in tiles:
@@ -1012,7 +1130,10 @@ class TouchBar:
             for entry in profile.get("buttons", [])
         ]
         if profile.get("claude"):
-            return self.claude_tiles(self.claude) + rows
+            # The read-out moved to the identity slot so media controls can sit
+            # between it and the shortcuts, and so the shortcuts are what gets
+            # squeezed when the bar runs out of room.
+            return rows
         if profile.get("name") == "ChatGPT":
             return self.chatgpt_tiles() + rows
         return rows
@@ -1179,13 +1300,20 @@ class TouchBar:
         ws_row = self.workspace_group(
             workspaces, active_ws, profile.get("collapse_workspaces", False)
         )
-        identity_row = [] if profile.get("show_identity") is False \
-            else self.app_identity(profile, active_win)
+        if profile.get("claude"):
+            identity_row = self.claude_tiles(self.claude)
+        elif profile.get("show_identity") is False:
+            identity_row = []
+        else:
+            identity_row = self.app_identity(profile, active_win)
         ctx_row = self.context_group(profile)
         tab_row = self.tab_group(profile)
-        spare = budget - len(ws_row) - len(identity_row) - len(ctx_row) - len(tab_row)
+        media_row = self.media_group()
+        spare = (budget - len(ws_row) - len(identity_row) - len(media_row)
+                 - len(ctx_row) - len(tab_row))
         win_row = self.window_group(clients, active_win, spare, profile)
-        return self.compose([ws_row, identity_row, ctx_row, tab_row, win_row], trailing)
+        return self.compose(
+            [ws_row, identity_row, media_row, ctx_row, tab_row, win_row], trailing)
 
     def page_apps(self):
         """Live running-app dock followed by controls for the active app."""
@@ -1560,6 +1688,14 @@ class TouchBar:
             elif value in ("workspaces", "claude", "chatgpt"):
                 self.page = "auto" if self.page == value else value
             self.prev_specs = []  # no decorative transition on navigation UI
+            self.render()
+        elif kind == "media":
+            if value == "mute":
+                self.media.toggle_mute()
+            else:
+                self.media.call({"playpause": "PlayPause", "next": "Next",
+                                 "previous": "Previous"}.get(value, "PlayPause"))
+                self.media.checked = 0.0
             self.render()
         elif kind in ("model", "effort") and value:
             self.run_slash("/%s %s" % (kind, value))
@@ -2112,11 +2248,14 @@ def animate_live_states(bar):
     while True:
         active = bar.active_window()
         chatgpt_visible = re.search(r"^(chatgpt|ChatGPT)$", active.get("class", ""))
+        bar.media.refresh()
         moving = bar.voice_state in ("recording", "transcribing") \
-            or (chatgpt_visible and bar.chatgpt_thinking)
+            or (chatgpt_visible and bar.chatgpt_thinking) \
+            or bar.media.playing
         if moving:
             bar.voice_phase += 1
             bar.chatgpt_phase += 1
+            bar.media_phase += 1
             bar.render()
             time.sleep(0.24)
         else:

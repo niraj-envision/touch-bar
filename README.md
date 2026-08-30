@@ -10,6 +10,8 @@ full-height, animated interface that follows the focused app.
 - Browser controls and tab shortcuts with a collapsed workspace drawer
 - App-aware layouts for terminals, Claude Code, ChatGPT, editors, Spotify,
   Discord, Obsidian, and general windows
+- Media transport with an animated equaliser wherever something is playing,
+  read from MPRIS, with mute
 - Always-available dictation while typing, with recording/transcribing states
 - Native ChatGPT dictation plus Claude-style live model, context, output,
   turns, tools, elapsed-time, task, and rate-limit telemetry

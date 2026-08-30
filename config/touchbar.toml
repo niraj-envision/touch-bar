@@ -95,7 +95,6 @@ buttons = [
   { label = "/",      keys = "Slash",     size = 27, hint = "Slash commands" },
   { label = "@",      keys = "SHIFT+2",   size = 25, hint = "Mention a file" },
   { label = "!",      keys = "SHIFT+1",   size = 27, color = "green", hint = "Bash mode" },
-  { label = "󰅃", keys = "Up",  size = 26, hint = "Previous prompt" },
 ]
 
 [[profiles]]
