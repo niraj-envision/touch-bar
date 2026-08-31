@@ -53,7 +53,7 @@ CHATGPT_DICTATE = os.path.join(HOME, ".local", "bin", "omarchy-chatgpt-dictate")
 HYPR_SIG = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
 HYPR_DIR = os.path.join(RUNTIME, "hypr", HYPR_SIG)
 
-PAGES = ("auto", "apps", "fn")
+PAGES = ("auto", "apps", "system", "settings", "fn")
 
 # The panel is 2170x60. tiny-dfr splits it into equal cells separated by
 # BUTTON_SPACING_PX, and prepends an "esc" button of its own on panels this
@@ -719,6 +719,163 @@ class MediaState:
         self.checked = 0.0
 
 
+def hwmon_by_name(name):
+    """The /sys/class/hwmon entry whose chip name matches, if present."""
+    for entry in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        for probe in (os.path.join(entry, "name"),
+                      os.path.join(entry, "device", "name")):
+            try:
+                with open(probe) as handle:
+                    if handle.read().strip() == name:
+                        return entry
+            except OSError:
+                continue
+    return None
+
+
+def read_int(path):
+    try:
+        with open(path) as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def human_kb(kb):
+    return "%.1fG" % (kb / 1048576.0) if kb >= 1048576 else "%dM" % (kb // 1024)
+
+
+class SystemStats:
+    """Machine vitals and level controls, read as cheaply as possible.
+
+    Everything on the system page comes straight from procfs/sysfs, so a poll
+    costs microseconds. Only the volume readout shells out (wpctl), and only
+    while the settings page is showing.
+    """
+
+    def __init__(self):
+        self.checked = 0.0
+        self.controls_checked = 0.0
+        self.cpu = 0.0
+        self._cpu_prev = None
+        self.load = 0.0
+        self.mem_frac = 0.0
+        self.mem_used = self.mem_total = 0        # kB
+        self.swap_frac = 0.0
+        self.swap_used = self.swap_total = 0
+        self.temp = None                          # CPU package, °C
+        self.fans = []                            # (rpm, max rpm or None)
+        self.battery = None                       # (percent, status)
+        self.brightness = None                    # screen backlight, 0-100
+        self.kbd = None                           # keyboard backlight, 0-100
+        self.volume = None                        # (percent, muted)
+        temp_dir = hwmon_by_name("coretemp")
+        self._temp_path = os.path.join(temp_dir, "temp1_input") if temp_dir else None
+        self._fan_dir = None
+        smc = hwmon_by_name("applesmc")
+        if smc:
+            # Fan attributes live on the class device on some kernels and on
+            # the platform device on others.
+            for probe in (smc, os.path.join(smc, "device")):
+                if glob.glob(os.path.join(probe, "fan*_input")):
+                    self._fan_dir = probe
+                    break
+        batteries = sorted(glob.glob("/sys/class/power_supply/BAT*"))
+        self._battery_dir = batteries[0] if batteries else None
+        # The Touch Bar's own strip is a backlight device too; skip it.
+        screens = sorted(p for p in glob.glob("/sys/class/backlight/*")
+                         if "appletb" not in p)
+        self._backlight_dir = screens[0] if screens else None
+        keyboards = sorted(glob.glob("/sys/class/leds/*kbd_backlight*"))
+        self._kbd_dir = keyboards[0] if keyboards else None
+        self.backlight_device = (os.path.basename(self._backlight_dir)
+                                 if self._backlight_dir else None)
+        self.kbd_device = os.path.basename(self._kbd_dir) if self._kbd_dir else None
+
+    def refresh(self, interval=1.5):
+        now = time.monotonic()
+        if now - self.checked < interval:
+            return False
+        self.checked = now
+        try:
+            with open("/proc/stat") as handle:
+                fields = [float(f) for f in handle.readline().split()[1:]]
+            idle = fields[3] + fields[4]          # idle + iowait
+            total = sum(fields)
+            if self._cpu_prev:
+                span = total - self._cpu_prev[1]
+                if span > 0:
+                    self.cpu = max(0.0, min(1.0,
+                        1.0 - (idle - self._cpu_prev[0]) / span))
+            self._cpu_prev = (idle, total)
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            self.load = os.getloadavg()[0]
+        except OSError:
+            pass
+        try:
+            info = {}
+            with open("/proc/meminfo") as handle:
+                for line in handle:
+                    key, _, rest = line.partition(":")
+                    info[key] = int(rest.split()[0])
+            self.mem_total = info.get("MemTotal", 0)
+            self.mem_used = self.mem_total - info.get("MemAvailable", 0)
+            self.swap_total = info.get("SwapTotal", 0)
+            self.swap_used = self.swap_total - info.get("SwapFree", 0)
+            self.mem_frac = self.mem_used / self.mem_total if self.mem_total else 0.0
+            self.swap_frac = (self.swap_used / self.swap_total
+                              if self.swap_total else 0.0)
+        except (OSError, ValueError, IndexError):
+            pass
+        milli = read_int(self._temp_path) if self._temp_path else None
+        self.temp = milli / 1000.0 if milli is not None else None
+        fans = []
+        if self._fan_dir:
+            for path in sorted(glob.glob(os.path.join(self._fan_dir, "fan*_input"))):
+                rpm = read_int(path)
+                if rpm is not None:
+                    fans.append((rpm, read_int(path[:-6] + "_max")))
+        self.fans = fans
+        if self._battery_dir:
+            percent = read_int(os.path.join(self._battery_dir, "capacity"))
+            try:
+                with open(os.path.join(self._battery_dir, "status")) as handle:
+                    status = handle.read().strip()
+            except OSError:
+                status = ""
+            self.battery = (percent, status) if percent is not None else None
+        return True
+
+    @staticmethod
+    def _level(directory):
+        if not directory:
+            return None
+        current = read_int(os.path.join(directory, "brightness"))
+        full = read_int(os.path.join(directory, "max_brightness"))
+        if current is None or not full:
+            return None
+        return int(round(current * 100.0 / full))
+
+    def refresh_controls(self, interval=1.5):
+        now = time.monotonic()
+        if now - self.controls_checked < interval:
+            return False
+        self.controls_checked = now
+        self.brightness = self._level(self._backlight_dir)
+        self.kbd = self._level(self._kbd_dir)
+        try:
+            out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                                 capture_output=True, text=True, timeout=2).stdout
+            match = re.search(r"([\d.]+)", out)
+            self.volume = (int(round(float(match.group(1)) * 100)),
+                           "MUTED" in out) if match else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            self.volume = None
+        return True
+
+
 def until(iso):
     """'2026-09-06T15:00:00+00:00' -> '6d'. Empty when it has already passed."""
     target = stamp_to_epoch(iso)
@@ -1335,6 +1492,7 @@ class TouchBar:
         self.limits = UsageLimits()
         self.media = MediaState()
         self.media_phase = 0
+        self.stats = SystemStats()
         self.browser = BrowserTabs()
         self.browser_offset = 0
         self.browser_capacity = 0
@@ -1825,8 +1983,10 @@ class TouchBar:
         return ((window_class[:1] or "?").upper(), "muted")
 
     def mode_group(self):
-        icons = {"auto": "󰀻", "apps": "", "fn": ""}
-        colors = {"auto": "accent", "apps": "green", "fn": "muted"}
+        icons = {"auto": "󰀻", "apps": "",
+                 "system": "󰍛", "settings": "", "fn": ""}
+        colors = {"auto": "accent", "apps": "green", "system": "cyan",
+                  "settings": "yellow", "fn": "muted"}
         rows = [spec(icons.get(self.page, ""), None,
                      fill="sunken", fg=colors.get(self.page, "muted"), size=24,
                      daemon="page:next")]
@@ -2044,6 +2204,89 @@ class TouchBar:
                 for n in range(1, 13)]
         return self.compose([rows], self.mode_group())
 
+    def page_system(self):
+        """Live machine vitals, re-read every couple of seconds while open."""
+        stats = self.stats
+        stats.refresh(interval=1.0)
+
+        def tile(value, caption, color, gauge=None):
+            extra = {}
+            if gauge is not None:
+                extra.update(gauge=max(0.0, min(1.0, gauge)), bar=color,
+                             track="darker_background")
+            return spec(str(value), None, fill="sunken", fg=color, size=20,
+                        gloss=False, sub=caption, **extra)
+
+        rows = []
+        if stats.battery:
+            percent, status = stats.battery
+            plugged = status in ("Charging", "Full", "Not charging")
+            color = ("green" if plugged else
+                     "red" if percent <= 15 else
+                     "yellow" if percent <= 40 else "fg")
+            rows.append(tile("%d%%" % percent,
+                             ("battery " + status).strip().lower(),
+                             color, percent / 100.0))
+        cpu = int(round(stats.cpu * 100))
+        rows.append(tile("%d%%" % cpu, "cpu",
+                         "green" if cpu < 50 else "yellow" if cpu < 85 else "red",
+                         stats.cpu))
+        rows.append(tile("%.2f" % stats.load, "load", "blue"))
+        mem = int(round(stats.mem_frac * 100))
+        rows.append(tile("%d%%" % mem,
+                         "ram %s/%s" % (human_kb(stats.mem_used),
+                                        human_kb(stats.mem_total)),
+                         "green" if mem < 60 else "yellow" if mem < 85 else "red",
+                         stats.mem_frac))
+        if stats.swap_total:
+            swap = int(round(stats.swap_frac * 100))
+            rows.append(tile("%d%%" % swap,
+                             "swap %s/%s" % (human_kb(stats.swap_used),
+                                             human_kb(stats.swap_total)),
+                             "green" if swap < 10 else "yellow" if swap < 30
+                             else "red",
+                             stats.swap_frac))
+        if stats.temp is not None:
+            rows.append(tile("%d°" % round(stats.temp), "cpu temp",
+                             "green" if stats.temp < 70 else
+                             "yellow" if stats.temp < 85 else "red",
+                             stats.temp / 100.0))
+        for index, (rpm, top) in enumerate(stats.fans):
+            rows.append(tile(rpm, "fan %d rpm" % (index + 1), "cyan",
+                             rpm / float(top) if top else None))
+        return self.compose([rows], self.mode_group())
+
+    def page_settings(self):
+        """Screen brightness, volume, and keyboard backlight, adjusted in place."""
+        stats = self.stats
+        stats.refresh_controls(interval=1.0)
+
+        def level(value, caption, color):
+            return spec("--" if value is None else "%d%%" % value, None,
+                        fill="sunken", fg=color, size=20, gloss=False,
+                        sub=caption, gauge=(value or 0) / 100.0, bar=color,
+                        track="darker_background")
+
+        def button(glyph, action, color="fg"):
+            return spec(glyph, None, fill="surface", fg=color, size=24,
+                        daemon="sys:%s" % action)
+
+        muted = bool(stats.volume and stats.volume[1])
+        volume = None if stats.volume is None else stats.volume[0]
+        rows = [
+            button("", "bright-"),
+            level(stats.brightness, "\U000f00e0 screen", "yellow"),
+            button("", "bright+"),
+            button("", "vol-"),
+            level(volume, "\U000f057e volume", "muted" if muted else "green"),
+            button("", "vol+"),
+            button("\U000f075f", "mute", "red" if muted else "muted"),
+            button("", "kbd-"),
+            level(stats.kbd, "\U000f030c keyboard", "cyan"),
+            button("", "kbd+"),
+        ]
+        return self.compose([rows], self.mode_group())
+
     def specs(self):
         self.browser_active = False
         if self.page == "fn":
@@ -2060,6 +2303,10 @@ class TouchBar:
             return self.page_efforts()
         if self.page == "chatgpt":
             return self.page_chatgpt()
+        if self.page == "system":
+            return self.page_system()
+        if self.page == "settings":
+            return self.page_settings()
         return self.page_auto()
 
     # -- output -----------------------------------------------------------
@@ -2375,12 +2622,43 @@ class TouchBar:
             self.page = "auto"
             self.prev_specs = []
             self.render()
+        elif kind == "sys" and value:
+            self.system_control(value)
         elif kind == "voice":
             self.clear_dictation() if value == "clear" else self.toggle_voice()
         elif kind == "focus" and value:
             hypr('dispatch hl.dsp.focus({ window = "address:%s" })' % value,
                  as_json=False)
             self.invalidate_state()
+
+    def system_control(self, value):
+        """Adjust one of the settings-page levels, then show the new value."""
+        stats = self.stats
+        screen, kbd = stats.backlight_device, stats.kbd_device
+        commands = {
+            # --min-value keeps a stray tap from turning the screen fully off.
+            "bright-": ["brightnessctl", "--min-value=5", "-d", screen,
+                        "s", "10%-"] if screen else None,
+            "bright+": ["brightnessctl", "-d", screen, "s", "10%+"]
+                       if screen else None,
+            "kbd-": ["brightnessctl", "-d", kbd, "s", "10%-"] if kbd else None,
+            "kbd+": ["brightnessctl", "-d", kbd, "s", "10%+"] if kbd else None,
+            "vol-": ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"],
+            "vol+": ["wpctl", "set-volume", "-l", "1.0",
+                     "@DEFAULT_AUDIO_SINK@", "5%+"],
+            "mute": ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
+        }
+        args = commands.get(value)
+        if not args:
+            return
+        try:
+            subprocess.run(args, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=2, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            sys.stderr.write("omarchy-touchbar: %s failed: %s\n" % (value, exc))
+            return
+        stats.controls_checked = 0.0        # reflect the new level immediately
+        self.render(allow_animation=False)
 
     def run_slash(self, command):
         """Type a slash command into the focused Claude Code prompt.
@@ -2628,6 +2906,10 @@ def watch_fn(bar):
         sys.stderr.write("omarchy-touchbar: no internal keyboard; Fn is ungated\n")
         return
     while True:
+        # Event nodes renumber when the T2 re-enumerates after suspend, so a
+        # remembered path can go permanently dead. Re-resolve on every
+        # (re)connect and keep the old path only while the device is missing.
+        path = find_input_device(KEYBOARD_NAME) or path
         try:
             with open(path, "rb", buffering=0) as handle:
                 while True:
@@ -2657,6 +2939,9 @@ def watch_touches(bar):
     start_x = None
     started_at = 0.0
     while True:
+        # Same trap as watch_fn: the digitizer's event node renumbers across
+        # suspend, and reopening the stale path would ignore touches forever.
+        path = find_digitizer() or path
         try:
             with open(path, "rb", buffering=0) as handle:
                 while True:
@@ -2742,6 +3027,19 @@ def watch_browser(bar):
                 bar.browser_marquee += 1
                 bar.render(allow_animation=False)
         time.sleep(BROWSER_POLL)
+
+
+def watch_system(bar):
+    """Keep the system and settings pages current while they are showing."""
+    while True:
+        if bar.page == "system":
+            bar.stats.refresh(interval=1.5)
+            bar.render(allow_animation=False)
+        elif bar.page == "settings":
+            # Levels can move underneath us (volume keys, ambient sensor).
+            if bar.stats.refresh_controls(interval=1.5):
+                bar.render(allow_animation=False)
+        time.sleep(2.0)
 
 
 def keep_awake(bar):
@@ -3089,6 +3387,7 @@ def run_daemon():
     threading.Thread(target=watch_claude, args=(bar,), daemon=True).start()
     threading.Thread(target=keep_awake, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_media, args=(bar,), daemon=True).start()
+    threading.Thread(target=watch_system, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_browser, args=(bar,), daemon=True).start()
     threading.Thread(target=serve, args=(bar,), daemon=True).start()
     bar.render()

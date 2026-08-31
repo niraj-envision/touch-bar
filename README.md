@@ -64,9 +64,18 @@ omarchy-touchbar status
 omarchy-touchbar render
 omarchy-touchbar page auto
 omarchy-touchbar page workspaces
+omarchy-touchbar page system      # battery, CPU, load, RAM, swap, temp, fans
+omarchy-touchbar page settings    # screen brightness, volume, keyboard backlight
 omarchy-touchbar page fn
 omarchy-touchbar preview
 ```
+
+The **system** page shows live machine vitals (battery, CPU usage, load, RAM,
+swap, CPU temperature, fan RPM) refreshed every couple of seconds while open.
+The **settings** page adjusts screen brightness, output volume (with mute), and
+keyboard backlight with −/+ buttons; levels come from sysfs and `wpctl`, so
+changes made elsewhere (volume keys) show up live. Both are part of the page
+cycle on the mode button.
 
 Edit `~/.config/omarchy/touchbar.toml` to tune profiles, icons, colors, buttons,
 workspace count, brightness, clock, battery, and animation settings. Saving it
