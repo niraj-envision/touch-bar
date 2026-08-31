@@ -292,6 +292,41 @@ class BrowserTabs:
         # tap time, deadline).
         self.override = None
         self.file_selected = 0
+        self.select_mods = self.load_select_chord()
+
+    def load_select_chord(self):
+        """The modifier that jumps straight to tab N. Firefox binds accel+N,
+        but Zen rebinds it to Alt+N, so read the profile's actual shortcut
+        table rather than assuming."""
+        mods = "CTRL"
+        if not self.profile:
+            return mods
+        path = os.path.join(self.profile, "zen-keyboard-shortcuts.json")
+        try:
+            with open(path) as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return mods
+        entries = data if isinstance(data, list) else \
+            (data.get("shortcuts") or [])
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("id") != "key_selectTab1" \
+                    or entry.get("disabled"):
+                continue
+            flags = entry.get("modifiers") or {}
+            parts = []
+            if flags.get("control") or flags.get("accel"):
+                parts.append("CTRL")
+            if flags.get("alt"):
+                parts.append("ALT")
+            if flags.get("shift"):
+                parts.append("SHIFT")
+            if flags.get("meta"):
+                parts.append("SUPER")
+            if parts:
+                mods = "+".join(parts)
+            break
+        return mods
 
     @staticmethod
     def find_profile():
@@ -367,6 +402,7 @@ class BrowserTabs:
             self.recovery = os.path.join(
                 self.profile, "sessionstore-backups", "recovery.jsonlz4")
             self.favicon_db = os.path.join(self.profile, "favicons.sqlite")
+            self.select_mods = self.load_select_chord()
         try:
             info = os.stat(self.recovery)
             stamp = (info.st_mtime_ns, info.st_size)
@@ -830,6 +866,24 @@ class ClaudeTotals:
         return sum(n for t, n in self.recent if t >= cutoff)
 
 
+def child_pids(pid):
+    """Children of every thread, not just the main one: GTK terminals like
+    Ghostty spawn their shells from worker threads, and those children only
+    appear in that thread's /proc/<pid>/task/<tid>/children."""
+    kids = []
+    try:
+        tids = os.listdir("/proc/%d/task" % pid)
+    except OSError:
+        return kids
+    for tid in tids:
+        try:
+            with open("/proc/%d/task/%s/children" % (pid, tid)) as handle:
+                kids.extend(int(x) for x in handle.read().split())
+        except (OSError, ValueError):
+            continue
+    return kids
+
+
 def descendant_named(pid, name, depth=0):
     """Find `claude` running under a terminal window's process."""
     if depth > 6:
@@ -838,11 +892,9 @@ def descendant_named(pid, name, depth=0):
         with open("/proc/%d/comm" % pid) as handle:
             if handle.read().strip() == name:
                 return pid
-        with open("/proc/%d/task/%d/children" % (pid, pid)) as handle:
-            kids = [int(x) for x in handle.read().split()]
-    except (OSError, ValueError):
+    except OSError:
         return None
-    for kid in kids:
+    for kid in child_pids(pid):
         found = descendant_named(kid, name, depth + 1)
         if found:
             return found
@@ -2228,15 +2280,17 @@ class TouchBar:
         self.browser_user_paging_until = 0.0
         self.render(allow_animation=False)
 
+        mods = self.browser.select_mods
+
         def type_switch():
             if target < 8:
-                args = wtype_args("CTRL+%d" % (target + 1))
+                args = wtype_args("%s+%d" % (mods, target + 1))
                 if args:
                     subprocess.run(["wtype"] + args, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, check=False)
                 return
             if target == count - 1:
-                args = wtype_args("CTRL+9")
+                args = wtype_args("%s+9" % mods)
                 if args:
                     subprocess.run(["wtype"] + args, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, check=False)
