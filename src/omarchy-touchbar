@@ -285,6 +285,13 @@ class BrowserTabs:
         self.signature = None
         self.icon_cache = {}
         self.icon_stamp = None
+        self.session_cache = (None, None)   # (file stamp, parsed session)
+        self.profile_checked = 0.0
+        # The session file lags a Touch Bar tab tap by up to ~15s. Hold the
+        # tapped selection until the file moves: (target, file's selection at
+        # tap time, deadline).
+        self.override = None
+        self.file_selected = 0
 
     @staticmethod
     def find_profile():
@@ -349,7 +356,17 @@ class BrowserTabs:
             return False
         self.checked = now
         if not self.recovery:
-            return False
+            # The browser may simply not have been running when the daemon
+            # started; look for its profile again now and then.
+            if now - self.profile_checked < 15.0:
+                return False
+            self.profile_checked = now
+            self.profile = self.find_profile()
+            if not self.profile:
+                return False
+            self.recovery = os.path.join(
+                self.profile, "sessionstore-backups", "recovery.jsonlz4")
+            self.favicon_db = os.path.join(self.profile, "favicons.sqlite")
         try:
             info = os.stat(self.recovery)
             stamp = (info.st_mtime_ns, info.st_size)
@@ -361,12 +378,17 @@ class BrowserTabs:
         composite = stamp + (focus,)
         if not force and composite == self.stamp:
             return False
-        try:
-            with open(self.recovery, "rb") as handle:
-                session = json.loads(decompress_mozlz4(handle.read()))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            sys.stderr.write("omarchy-touchbar: cannot read browser tabs: %s\n" % exc)
-            return False
+        cached_stamp, session = self.session_cache
+        if cached_stamp != stamp:
+            # Only decompress when the file itself changed; a mere focus or
+            # title change re-picks the window from the parsed session.
+            try:
+                with open(self.recovery, "rb") as handle:
+                    session = json.loads(decompress_mozlz4(handle.read()))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                sys.stderr.write("omarchy-touchbar: cannot read browser tabs: %s\n" % exc)
+                return False
+            self.session_cache = (stamp, session)
         window = self.choose_window(session, active_win)
         if not window:
             return False
@@ -390,6 +412,13 @@ class BrowserTabs:
                 selected = len(kept)
             kept.append({"title": title, "url": url,
                          "image": tab.get("image") or tab.get("zenPinnedIcon")})
+        self.file_selected = selected
+        if self.override:
+            target, at_tap, deadline = self.override
+            if time.monotonic() > deadline or selected != at_tap:
+                self.override = None     # the file caught up, or the user moved
+            elif target < len(kept):
+                selected = target
         new_signature = (selected, tuple((item["title"], item["url"])
                                          for item in kept))
         changed = new_signature != self.signature
@@ -440,6 +469,8 @@ class BrowserTabs:
             if mime:
                 result = "data:%s;base64,%s" % (
                     mime, base64.b64encode(bytes(data)).decode("ascii"))
+        if len(self.icon_cache) >= 256:      # icons are up to 300 KB each
+            self.icon_cache.pop(next(iter(self.icon_cache)))
         self.icon_cache[url] = result
         return result
 
@@ -624,8 +655,9 @@ class MediaState:
             if state == "Paused" and not chosen:
                 chosen, status = name, state
         self.player, self.status = chosen, status
-        volume = run_quiet(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
-        self.muted = "MUTED" in volume
+        if chosen:                    # mute only matters while transport shows
+            volume = run_quiet(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
+            self.muted = "MUTED" in volume
 
     def _property(self, name, prop):
         out = run_quiet(["busctl", "--user", "get-property", name, MPRIS_PATH,
@@ -1258,6 +1290,14 @@ class TouchBar:
         self.browser_has_marquee = False
         self.browser_active = False
         self.browser_user_paging_until = 0.0
+        # Animation frames arrive several times a second; each render used to
+        # cost four Hyprland IPC round-trips. Cache the compositor state and
+        # let the event watcher invalidate it, so polling threads ride the
+        # cache and only real changes touch the socket.
+        self._active_cache = {}
+        self._active_at = 0.0
+        self._snapshot_cache = None
+        self._snapshot_at = 0.0
 
     def _stamps(self):
         out = []
@@ -1277,13 +1317,23 @@ class TouchBar:
             self.last_written = None      # colours may have changed everywhere
 
     # -- state ------------------------------------------------------------
-    def snapshot(self):
-        return (
+    def snapshot(self, max_age=0.5):
+        now = time.monotonic()
+        if self._snapshot_cache is not None and now - self._snapshot_at < max_age:
+            return self._snapshot_cache
+        snap = (
             hypr("clients") or [],
             hypr("workspaces") or [],
             hypr("activeworkspace") or {},
             hypr("activewindow") or {},
         )
+        self._snapshot_cache, self._snapshot_at = snap, now
+        self._active_cache, self._active_at = snap[3], now
+        return snap
+
+    def invalidate_state(self):
+        self._active_at = 0.0
+        self._snapshot_at = 0.0
 
     def claude_pid(self, active_win):
         """The `claude` process running under this window, if there is one."""
@@ -2006,8 +2056,11 @@ class TouchBar:
 
     @staticmethod
     def hit_regions(specs, actions):
+        # Claim half of each spacing gap for the buttons either side, so a tap
+        # landing between two pills still hits the nearer one.
+        half = BUTTON_SPACING / 2.0
         return [
-            {"left": left, "right": left + width, "index": index,
+            {"left": left - half, "right": left + width + half, "index": index,
              "action": actions[index] if index < len(actions) else None}
             for index, (left, width) in enumerate(layout_metrics(specs))
         ]
@@ -2112,7 +2165,7 @@ class TouchBar:
             if target == "next":
                 base = self.page if self.page in PAGES else "auto"
                 self.page = PAGES[(PAGES.index(base) + 1) % len(PAGES)]
-            elif target in ("workspaces", "claude", "chatgpt"):
+            elif target in ("workspaces", "claude", "chatgpt", "models", "efforts"):
                 self.page = "auto" if self.page == target else target
             elif target in PAGES:
                 self.page = target
@@ -2156,8 +2209,13 @@ class TouchBar:
                                "last_touch": self.last_touch})
         return "unknown command"
 
-    def active_window(self):
-        return hypr("activewindow") or {}
+    def active_window(self, max_age=0.3):
+        now = time.monotonic()
+        if now - self._active_at < max_age:
+            return self._active_cache
+        win = hypr("activewindow") or {}
+        self._active_cache, self._active_at = win, now
+        return win
 
     def focus_browser_tab(self, target):
         count = len(self.browser.tabs)
@@ -2165,6 +2223,8 @@ class TouchBar:
             return
         current = min(self.browser.selected, count - 1)
         self.browser.selected = target       # immediate active underline
+        self.browser.override = (target, self.browser.file_selected,
+                                 time.monotonic() + 25.0)
         self.browser_user_paging_until = 0.0
         self.render(allow_animation=False)
 
@@ -2225,14 +2285,17 @@ class TouchBar:
                  as_json=False)
             if self.page == "workspaces":
                 self.page = "auto"
+            self.invalidate_state()
             self.prev_specs = []  # workspace navigation should feel immediate
             self.render()
         elif kind == "page":
             if value == "next":
                 base = self.page if self.page in PAGES else "auto"
                 self.page = PAGES[(PAGES.index(base) + 1) % len(PAGES)]
-            elif value in ("workspaces", "claude", "chatgpt"):
+            elif value in ("workspaces", "claude", "chatgpt", "models", "efforts"):
                 self.page = "auto" if self.page == value else value
+            elif value in PAGES:
+                self.page = value
             self.prev_specs = []  # no decorative transition on navigation UI
             self.render()
         elif kind == "keys" and value:
@@ -2263,6 +2326,7 @@ class TouchBar:
         elif kind == "focus" and value:
             hypr('dispatch hl.dsp.focus({ window = "address:%s" })' % value,
                  as_json=False)
+            self.invalidate_state()
 
     def run_slash(self, command):
         """Type a slash command into the focused Claude Code prompt.
@@ -2280,6 +2344,17 @@ class TouchBar:
                            check=False)
         except OSError as exc:
             sys.stderr.write("omarchy-touchbar: cannot type %r: %s\n" % (command, exc))
+
+    @staticmethod
+    def chatgpt_dictate():
+        """Toggle native ChatGPT dictation. Bounded: this runs on the touch
+        thread, and a hung helper must not take touch handling down with it."""
+        try:
+            return subprocess.run(
+                [CHATGPT_DICTATE], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=6).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     def send_key_state(self, key, state):
         hypr('dispatch hl.dsp.send_key_state({ key = "%s", state = "%s" })'
@@ -2302,9 +2377,7 @@ class TouchBar:
                 # across taps, then release it on the second tap.
                 self.send_key_state("SPACE", "down")
                 self.voice_state = "recording"
-            elif backend == "chatgpt" and subprocess.run(
-                    [CHATGPT_DICTATE], stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL).returncode == 0:
+            elif backend == "chatgpt" and self.chatgpt_dictate():
                 self.voice_state = "recording"
             else:
                 self.voice_backend = "voxtype"
@@ -2320,9 +2393,7 @@ class TouchBar:
                 self.send_key_state("SPACE", "up")
                 self.voice_state = "transcribing"
                 self.finish_native_later()
-            elif self.voice_backend == "chatgpt" and subprocess.run(
-                    [CHATGPT_DICTATE], stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL).returncode == 0:
+            elif self.voice_backend == "chatgpt" and self.chatgpt_dictate():
                 self.voice_state = "transcribing"
                 self.finish_native_later()
             else:
@@ -2414,19 +2485,35 @@ INTERESTING = (
 def watch_hyprland(bar):
     path = os.path.join(HYPR_DIR, ".socket2.sock")
     pending = threading.Event()
+    kinds = set()
+    kinds_lock = threading.Lock()
 
     def painter():
+        focused = None
         while True:
             pending.wait()
             time.sleep(0.04)          # coalesce bursts of events
             pending.clear()
-            active = bar.active_window()
+            with kinds_lock:
+                seen = set(kinds)
+                kinds.clear()
+            bar.invalidate_state()
+            active = bar.active_window(0)
+            address = active.get("address")
+            moved = address != focused
+            focused = address
             if bar.voice_state == "review" and bar.voice_target \
-                    and active.get("address") != bar.voice_target:
+                    and address != bar.voice_target:
                 bar.voice_state = "idle"
                 bar.review_until = 0.0
-            # Picking a workspace from the picker page is the end of that errand.
+            # Transient pages end with the errand that opened them: landing on
+            # a workspace closes the picker, and switching apps drops the
+            # Claude/ChatGPT panels. Unrelated events (a window opening on
+            # another workspace, a notification) leave them alone.
             if bar.page == "workspaces":
+                if moved or seen & {"workspace", "workspacev2", "focusedmon"}:
+                    bar.page = "auto"
+            elif bar.page in ("claude", "models", "efforts", "chatgpt") and moved:
                 bar.page = "auto"
             bar.render()
 
@@ -2444,7 +2531,10 @@ def watch_hyprland(bar):
                 buffer += chunk.decode(errors="replace")
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
-                    if line.split(">>", 1)[0] in INTERESTING:
+                    kind = line.split(">>", 1)[0]
+                    if kind in INTERESTING:
+                        with kinds_lock:
+                            kinds.add(kind)
                         pending.set()
         except Exception:                                   # noqa: BLE001
             pass
@@ -2581,7 +2671,7 @@ def watch_media(bar):
         if bar.media.active != was_active:
             was_active = bar.media.active
             bar.render()          # transport appeared or disappeared
-        time.sleep(1.5)
+        time.sleep(1.5 if bar.media.active else 3.0)
 
 
 def watch_browser(bar):
@@ -2719,14 +2809,19 @@ def latest_codex_state():
     if not paths:
         return {}
     now = time.time()
-    paths = sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True)[:16]
+    stamped = []
+    for path in paths:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if now - mtime <= 1800:
+            stamped.append((mtime, path))
+    stamped.sort(reverse=True)
     newest = None
     active_tasks = 0
     rate = {"usage": None, "secondary_usage": None, "mtime": -1}
-    for path in paths:
-        mtime = os.path.getmtime(path)
-        if now - mtime > 1800:
-            continue
+    for mtime, path in stamped[:16]:
         try:
             with open(path, "rb") as handle:
                 # Ignore guardian/reviewer/subagent rollouts. Their tiny,
@@ -2830,29 +2925,41 @@ def latest_codex_state():
 
 
 def watch_chatgpt(bar):
-    """Animate from actual Codex task events and show real telemetry."""
+    """Animate from actual Codex task events and show real telemetry.
+
+    Scanning the rollout logs is the most expensive poll in the daemon, so it
+    only runs while a ChatGPT window is focused, the expanded panel is open,
+    or a task it already saw is still live. Anywhere else it costs nothing.
+    """
     previous = None
     while True:
+        visible = bar.page == "chatgpt" or bool(re.search(
+            r"^(chatgpt|ChatGPT)$", bar.active_window().get("class", "") or ""))
+        if not visible and not bar.chatgpt_thinking:
+            time.sleep(2.5)
+            continue
         current = latest_codex_state()
         if current != previous:
             bar.chatgpt_stats = current
             bar.chatgpt_thinking = bool(current.get("thinking"))
             bar.chatgpt_usage = current.get("usage")
             previous = current
-            active = bar.active_window()
-            if re.search(r"^(chatgpt|ChatGPT)$", active.get("class", "")):
+            if visible:
                 bar.render()
-        time.sleep(0.45)
+        time.sleep(0.45 if visible else 1.5)
 
 
 def animate_live_states(bar):
-    """Four-frame animation only while recording/transcribing or thinking."""
+    """Four-frame animation only while something animated is on screen."""
     while True:
-        active = bar.active_window()
-        chatgpt_visible = re.search(r"^(chatgpt|ChatGPT)$", active.get("class", ""))
-        moving = bar.voice_state in ("recording", "transcribing") \
-            or (chatgpt_visible and bar.chatgpt_thinking) \
-            or bar.media.playing
+        moving = bar.voice_state in ("recording", "transcribing")
+        if not moving and bar.media.playing:
+            # The equaliser only exists on the auto page's media group.
+            moving = bar.page == "auto" and not bar.browser_active
+        if not moving and bar.chatgpt_thinking:
+            moving = bar.page == "chatgpt" or bool(re.search(
+                r"^(chatgpt|ChatGPT)$",
+                bar.active_window().get("class", "") or ""))
         if moving:
             bar.voice_phase += 1
             bar.chatgpt_phase += 1
@@ -2963,7 +3070,7 @@ def main():
     if reply is None:
         sys.stderr.write("omarchy-touchbar: daemon is not running\n")
         return 1
-    if args[0] == "status":
+    if reply:
         print(reply)
     return 0
 
