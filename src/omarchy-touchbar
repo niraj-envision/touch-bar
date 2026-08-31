@@ -20,6 +20,8 @@ come from the current Omarchy theme.
 """
 
 import calendar
+import base64
+import configparser
 import hashlib
 import html
 import glob
@@ -29,12 +31,14 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
 import threading
 import time
 import tomllib
+import urllib.parse
 
 HOME = os.path.expanduser("~")
 USER_CONFIG = os.path.join(HOME, ".config", "omarchy", "touchbar.toml")
@@ -82,6 +86,19 @@ GATE_TIMEOUT = 1.5
 # tiny-dfr dims at 30s and blanks at 60s of no input. Hold the panel lit for a
 # while after its contents change, so switching apps never lands on a dark bar.
 AWAKE_AFTER_CHANGE = 40.0
+
+# A deliberate horizontal drag pages browser tabs instead of firing the tile
+# under the release point. The digitizer reports the full bar as 0..32767.
+SWIPE_THRESHOLD_RAW = 2800
+SWIPE_MAX_SECONDS = 1.8
+BROWSER_POLL = 0.65
+
+GENERIC_FAVICON = "data:image/svg+xml;base64," + base64.b64encode(
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    b'<circle cx="16" cy="16" r="14" fill="#7daea3"/>'
+    b'<path d="M2 16h28M16 2c5 5 5 23 0 28M16 2c-5 5-5 23 0 28" '
+    b'fill="none" stroke="#161616" stroke-width="2"/></svg>'
+).decode("ascii")
 
 ANIMATION_FRAMES = (0.80, 0.92)
 ANIMATION_STEP = 0.04
@@ -177,6 +194,254 @@ def load_config():
     cfg["icons"] = user.get("icons", {})
     cfg["profiles"] = user.get("profiles", [])
     return cfg
+
+
+# ---------------------------------------------------------- browser tabs --
+def decompress_mozlz4(raw):
+    """Decode Firefox/Zen's mozLz4 block format without another dependency."""
+    if len(raw) < 12 or raw[:8] != b"mozLz40\0":
+        raise ValueError("not a mozLz4 file")
+    expected = struct.unpack("<I", raw[8:12])[0]
+    data = raw[12:]
+    out = bytearray()
+    pos = 0
+    while pos < len(data):
+        token = data[pos]
+        pos += 1
+        literal_len = token >> 4
+        if literal_len == 15:
+            while pos < len(data):
+                extra = data[pos]
+                pos += 1
+                literal_len += extra
+                if extra != 255:
+                    break
+        if pos + literal_len > len(data):
+            raise ValueError("truncated mozLz4 literals")
+        out.extend(data[pos:pos + literal_len])
+        pos += literal_len
+        if pos == len(data):
+            break
+        if pos + 2 > len(data):
+            raise ValueError("truncated mozLz4 offset")
+        offset = data[pos] | (data[pos + 1] << 8)
+        pos += 2
+        if offset <= 0 or offset > len(out):
+            raise ValueError("invalid mozLz4 offset")
+        match_len = token & 0x0f
+        if match_len == 15:
+            while pos < len(data):
+                extra = data[pos]
+                pos += 1
+                match_len += extra
+                if extra != 255:
+                    break
+        match_len += 4
+        start = len(out) - offset
+        for index in range(match_len):
+            out.append(out[start + index])
+        if expected and len(out) > expected:
+            raise ValueError("mozLz4 output exceeded declared size")
+    if expected and len(out) != expected:
+        raise ValueError("mozLz4 output size mismatch")
+    return bytes(out)
+
+
+def browser_title(title):
+    return re.sub(r"\s+[—-]\s+(Zen Browser|Mozilla Firefox|Firefox)$", "",
+                  str(title or ""), flags=re.I).strip()
+
+
+def favicon_mime(data):
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:4] == b"\x00\x00\x01\x00":
+        return "image/x-icon"
+    if b"<svg" in data[:512].lower():
+        return "image/svg+xml"
+    return None
+
+
+class BrowserTabs:
+    """Read live Firefox-family tabs and their local Places favicons."""
+
+    def __init__(self):
+        self.profile = self.find_profile()
+        self.recovery = os.path.join(
+            self.profile, "sessionstore-backups", "recovery.jsonlz4"
+        ) if self.profile else None
+        self.favicon_db = os.path.join(self.profile, "favicons.sqlite") \
+            if self.profile else None
+        self.stamp = None
+        self.checked = 0.0
+        self.tabs = []
+        self.selected = 0
+        self.signature = None
+        self.icon_cache = {}
+        self.icon_stamp = None
+
+    @staticmethod
+    def find_profile():
+        roots = [os.path.join(HOME, ".config", "zen"),
+                 os.path.join(HOME, ".mozilla", "firefox")]
+        candidates = []
+        for root in roots:
+            ini_path = os.path.join(root, "profiles.ini")
+            parser = configparser.ConfigParser()
+            try:
+                parser.read(ini_path)
+            except (OSError, configparser.Error):
+                parser = configparser.ConfigParser()
+            for section in parser.sections():
+                if not section.lower().startswith("profile"):
+                    continue
+                path = parser.get(section, "Path", fallback="")
+                if not path:
+                    continue
+                if parser.getboolean(section, "IsRelative", fallback=True):
+                    path = os.path.join(root, path)
+                recovery = os.path.join(path, "sessionstore-backups",
+                                        "recovery.jsonlz4")
+                if os.path.isfile(recovery):
+                    candidates.append((os.path.getmtime(recovery), path))
+            for recovery in glob.glob(os.path.join(
+                    root, "*", "sessionstore-backups", "recovery.jsonlz4")):
+                candidates.append((os.path.getmtime(recovery),
+                                   os.path.dirname(os.path.dirname(recovery))))
+        return max(candidates)[1] if candidates else None
+
+    @staticmethod
+    def current_entry(tab):
+        entries = tab.get("entries") or []
+        if not entries:
+            return {}
+        index = max(0, min(len(entries) - 1, int(tab.get("index", 1)) - 1))
+        return entries[index] or {}
+
+    def choose_window(self, session, active_win):
+        windows = session.get("windows") or []
+        if not windows:
+            return None
+        wanted = browser_title((active_win or {}).get("title"))
+        if wanted and wanted.lower() not in ("zen browser", "mozilla firefox", "firefox"):
+            for window in windows:
+                tabs = window.get("tabs") or []
+                selected = max(0, min(len(tabs) - 1,
+                                     int(window.get("selected", 1)) - 1))
+                if tabs:
+                    title = browser_title(self.current_entry(tabs[selected]).get("title"))
+                    if title == wanted:
+                        return window
+        selected_window = max(0, int(session.get("selectedWindow", 1)) - 1)
+        if selected_window < len(windows):
+            return windows[selected_window]
+        return max(windows, key=lambda item: item.get("zIndex", 0))
+
+    def refresh(self, active_win=None, force=False):
+        now = time.monotonic()
+        if not force and now - self.checked < 0.35:
+            return False
+        self.checked = now
+        if not self.recovery:
+            return False
+        try:
+            info = os.stat(self.recovery)
+            stamp = (info.st_mtime_ns, info.st_size)
+        except OSError:
+            return False
+        # A focus change between two Zen windows can select a different window
+        # from an otherwise unchanged session file, so title is part of stamp.
+        focus = browser_title((active_win or {}).get("title"))
+        composite = stamp + (focus,)
+        if not force and composite == self.stamp:
+            return False
+        try:
+            with open(self.recovery, "rb") as handle:
+                session = json.loads(decompress_mozlz4(handle.read()))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            sys.stderr.write("omarchy-touchbar: cannot read browser tabs: %s\n" % exc)
+            return False
+        window = self.choose_window(session, active_win)
+        if not window:
+            return False
+        all_tabs = window.get("tabs") or []
+        selected_tab = max(0, min(len(all_tabs) - 1,
+                                  int(window.get("selected", 1)) - 1))
+        active_space = window.get("activeZenSpace")
+        kept = []
+        selected = 0
+        for original, tab in enumerate(all_tabs):
+            if tab.get("hidden"):
+                continue
+            workspace = tab.get("zenWorkspace")
+            if active_space and workspace and workspace != active_space:
+                continue
+            entry = self.current_entry(tab)
+            url = str(entry.get("url") or "")
+            title = browser_title(entry.get("title")) or urllib.parse.urlsplit(url).hostname \
+                or "New tab"
+            if original == selected_tab:
+                selected = len(kept)
+            kept.append({"title": title, "url": url,
+                         "image": tab.get("image") or tab.get("zenPinnedIcon")})
+        new_signature = (selected, tuple((item["title"], item["url"])
+                                         for item in kept))
+        changed = new_signature != self.signature
+        self.tabs = kept
+        self.selected = min(selected, max(0, len(kept) - 1))
+        self.signature = new_signature
+        self.stamp = composite
+        return changed
+
+    def favicon(self, tab):
+        image = tab.get("image")
+        if isinstance(image, str) and image.startswith("data:image/") \
+                and len(image) < 300000:
+            return image
+        url = tab.get("url") or ""
+        if not url or not self.favicon_db:
+            return None
+        try:
+            stamp = os.stat(self.favicon_db).st_mtime_ns
+        except OSError:
+            return None
+        if stamp != self.icon_stamp:
+            self.icon_stamp = stamp
+            self.icon_cache.clear()
+        if url in self.icon_cache:
+            return self.icon_cache[url]
+        data = None
+        quoted = urllib.parse.quote(self.favicon_db)
+        query = (
+            "SELECT i.data FROM moz_pages_w_icons p "
+            "JOIN moz_icons_to_pages x ON x.page_id=p.id "
+            "JOIN moz_icons i ON i.id=x.icon_id "
+            "WHERE p.page_url=? AND i.data IS NOT NULL "
+            "ORDER BY CASE WHEN i.width BETWEEN 20 AND 64 THEN 0 ELSE 1 END, "
+            "ABS(i.width-32) LIMIT 1"
+        )
+        try:
+            db = sqlite3.connect("file:%s?mode=ro&immutable=1" % quoted,
+                                 uri=True, timeout=0.05)
+            row = db.execute(query, (url,)).fetchone()
+            db.close()
+            data = row[0] if row else None
+        except sqlite3.Error:
+            data = None
+        result = None
+        if data and len(data) < 300000:
+            mime = favicon_mime(bytes(data))
+            if mime:
+                result = "data:%s;base64,%s" % (
+                    mime, base64.b64encode(bytes(data)).decode("ascii"))
+        self.icon_cache[url] = result
+        return result
 
 
 class Palette:
@@ -701,6 +966,20 @@ def cell_width(slots):
     return (BAR_WIDTH - BUTTON_SPACING * (cells - 1)) / cells
 
 
+def layout_metrics(specs):
+    """Return pixel left/width pairs using tiny-dfr's Stretch proportions."""
+    weights = [1] + [max(1, int(item.get("stretch", 1) or 1)) for item in specs]
+    gaps = max(0, len(weights) - 1)
+    unit = (BAR_WIDTH - BUTTON_SPACING * gaps) / float(sum(weights))
+    metrics = []
+    left = 0.0
+    for weight in weights:
+        width = unit * weight
+        metrics.append((left, width))
+        left += width + BUTTON_SPACING
+    return metrics
+
+
 def build_svg(spec, width, radius, font, scale=1.0):
     """One button, drawn edge to edge so we own every pixel of it."""
     label = html.escape(spec.get("label", ""))
@@ -751,8 +1030,49 @@ def build_svg(spec, width, radius, font, scale=1.0):
                 'font-weight="bold" fill="%s" text-anchor="middle">%s</text>'
                 % (width / 2, y, font, px, colour, body))
 
+    favicon = spec.get("favicon")
+    tab_title = str(spec.get("tab_title") or "")
+    if favicon:
+        compact_tab = bool(spec.get("tab_compact")) or width < 132
+        icon_size = 34 if compact_tab else 30
+        icon_x = (width - icon_size) / 2 if compact_tab else 15
+        icon_y = (BAR_HEIGHT - icon_size) / 2
+        body = (
+            '<clipPath id="tabicon"><rect x="%.2f" y="%.2f" width="%d" height="%d" rx="6"/></clipPath>'
+            '<image href="%s" x="%.2f" y="%.2f" width="%d" height="%d" '
+            'preserveAspectRatio="xMidYMid meet" clip-path="url(#tabicon)"/>'
+            % (icon_x, icon_y, icon_size, icon_size, html.escape(favicon, quote=True),
+               icon_x, icon_y, icon_size, icon_size)
+        )
+        if not compact_tab and tab_title:
+            text_left = icon_x + icon_size + 11
+            text_right = width - (27 if spec.get("badge") else 12)
+            capacity = max(3, int((text_right - text_left) / 10.2))
+            shown = tab_title
+            if len(shown) > capacity:
+                loop = shown + "   ·   "
+                offset = int(spec.get("marquee", 0)) % len(loop)
+                shown = (loop + loop)[offset:offset + capacity]
+            body += (
+                '<clipPath id="tabtext"><rect x="%.2f" y="7" width="%.2f" height="46"/></clipPath>'
+                '<text x="%.2f" y="37" font-family="%s" font-size="18" '
+                'font-weight="bold" fill="%s" text-anchor="start" '
+                'clip-path="url(#tabtext)">%s</text>'
+                % (text_left, max(1.0, text_right - text_left), text_left, font,
+                   fg, html.escape(shown))
+            )
+        if spec.get("tab_active"):
+            body += ('<rect x="14" y="53" width="%.2f" height="3" rx="1.5" fill="%s"/>'
+                     % (max(8.0, width - 28), fg))
+    elif spec.get("tab_fallback"):
+        body = text(BAR_HEIGHT / 2 + size * 0.36, label, size, fg)
+    else:
+        body = None
+
     bars = spec.get("bars")
-    if bars:
+    if body is not None:
+        pass
+    elif bars:
         count = len(bars)
         bar_w, gap = 7.0, 5.0
         span = count * bar_w + (count - 1) * gap
@@ -904,9 +1224,11 @@ class TouchBar:
         self.write_lock = threading.Lock()
         self.pending = None
         self.pending_since = 0.0
+        self.pending_hit_regions = None
         self.last_change = 0.0
         self.pending_actions = None
         self.touch_actions = [None] * (int(self.config["settings"]["slots"]) + 1)
+        self.touch_regions = []
         self.last_touch = None
         self.touch_down = False
         self.touch_released_at = 0.0
@@ -929,6 +1251,13 @@ class TouchBar:
         self.limits = UsageLimits()
         self.media = MediaState()
         self.media_phase = 0
+        self.browser = BrowserTabs()
+        self.browser_offset = 0
+        self.browser_capacity = 0
+        self.browser_marquee = 0
+        self.browser_has_marquee = False
+        self.browser_active = False
+        self.browser_user_paging_until = 0.0
 
     def _stamps(self):
         out = []
@@ -1278,9 +1607,7 @@ class TouchBar:
                      daemon="voice:toggle")]
 
     def tab_group(self, profile):
-        # Browser APIs do not expose live favicon metadata to Wayland. These
-        # deliberately look like favicon chips and retain the useful Ctrl+N
-        # direct-jump semantics; the corner number is the tab target.
+        """Static fallback for non-Firefox browsers or a missing session."""
         glyphs = profile.get("tab_icons", [""])
         colors = profile.get("tab_colors", ["blue", "magenta", "red", "yellow"])
         return [
@@ -1289,6 +1616,77 @@ class TouchBar:
                  badge=n)
             for n in range(1, int(profile.get("tabs", 0)) + 1)
         ]
+
+    def browser_controls(self, profile):
+        wanted = ("ALT+LEFT", "CTRL+T", "CTRL+W")
+        by_key = {str(entry.get("keys", "")).replace(" ", "").upper(): entry
+                  for entry in profile.get("buttons", [])}
+        rows = []
+        for key in wanted:
+            entry = by_key.get(key)
+            if not entry:
+                continue
+            rows.append(spec(entry.get("label", ""), entry.get("keys"),
+                             fill=entry.get("background", "sunken"),
+                             fg=entry.get("color", "fg"),
+                             size=entry.get("size", 25)))
+        return rows
+
+    def browser_tab_group(self, profile, active_win, capacity):
+        self.browser.refresh(active_win)
+        tabs = self.browser.tabs
+        self.browser_capacity = max(1, capacity)
+        self.browser_has_marquee = False
+        if not tabs:
+            self.browser_offset = 0
+            return self.tab_group(profile)[:capacity]
+
+        last_page = ((len(tabs) - 1) // self.browser_capacity) * self.browser_capacity
+        self.browser_offset = max(0, min(self.browser_offset, last_page))
+        selected = self.browser.selected
+        user_paging = time.monotonic() < self.browser_user_paging_until
+        if not user_paging and not (
+                self.browser_offset <= selected < self.browser_offset + self.browser_capacity):
+            self.browser_offset = (selected // self.browser_capacity) * self.browser_capacity
+
+        visible = tabs[self.browser_offset:self.browser_offset + self.browser_capacity]
+        total = len(tabs)
+        stretch = 12 if total == 1 else 6 if total == 2 else 4 if total == 3 \
+            else 3 if total == 4 else 2 if total == 5 else 1
+        compact_tabs = total >= 6
+        rows = []
+        for local, tab in enumerate(visible):
+            target = self.browser_offset + local
+            active = target == selected
+            title = tab.get("title") or "New tab"
+            favicon = self.browser.favicon(tab) or GENERIC_FAVICON
+            rows.append(spec(
+                "", None,
+                fill="accent" if active else "surface",
+                fg="on_accent" if active else "fg",
+                gloss=not active,
+                badge=target + 1,
+                daemon="browser-tab:%d" % target,
+                favicon=favicon,
+                tab_title=title,
+                tab_active=active,
+                tab_compact=compact_tabs,
+                marquee=self.browser_marquee,
+                stretch=stretch,
+            ))
+            if not compact_tabs and len(title) > 8:
+                self.browser_has_marquee = True
+        return rows
+
+    def page_browser(self, profile, active_win):
+        """Live favicon tab strip with a small, stable browser control cluster."""
+        self.browser_active = True
+        trailing = self.voice_group() + self.mode_group()
+        controls = self.browser_controls(profile)
+        capacity = max(1, int(self.config["settings"]["slots"])
+                       - len(trailing) - len(controls))
+        tabs = self.browser_tab_group(profile, active_win, capacity)
+        return self.compose([tabs, controls], trailing)
 
     def window_group(self, clients, active_win, budget, profile):
         settings = self.config["settings"]
@@ -1351,6 +1749,8 @@ class TouchBar:
         clients, workspaces, active_ws, active_win = self.snapshot()
         self.claude_for(active_win)
         profile = self.profile_for(active_win)
+        if profile.get("name") == "Browser":
+            return self.page_browser(profile, active_win)
         trailing = self.voice_group() + self.mode_group()
         budget = max(1, int(self.config["settings"]["slots"]) - len(trailing))
         ws_row = self.workspace_group(
@@ -1543,6 +1943,7 @@ class TouchBar:
         return self.compose([rows], self.mode_group())
 
     def specs(self):
+        self.browser_active = False
         if self.page == "fn":
             return self.page_fn()
         if self.page == "apps":
@@ -1562,19 +1963,21 @@ class TouchBar:
     # -- output -----------------------------------------------------------
     def to_toml(self, specs, scale_at=None):
         settings = self.config["settings"]
-        width = cell_width(int(settings["slots"]))
         radius = int(settings["corner_radius"])
         rows = []
-        for index, item in enumerate(specs):
+        metrics = layout_metrics(specs)[1:]
+        for index, (item, (_, width)) in enumerate(zip(specs, metrics)):
+            stretch = max(1, int(item.get("stretch", 1) or 1))
             if item.get("spacer"):
-                rows.append("    { Stretch = 1 },")
+                rows.append("    { Stretch = %d }," % stretch)
                 continue
             if item.get("time"):
-                rows.append('    { Time = %s, Action = "Time" },' % toml_string(item["time"]))
+                rows.append('    { Time = %s, Action = "Time", Stretch = %d },'
+                            % (toml_string(item["time"]), stretch))
                 continue
             if item.get("battery"):
-                rows.append('    { Battery = %s, Action = "Battery" },'
-                            % toml_string(item["battery"]))
+                rows.append('    { Battery = %s, Action = "Battery", Stretch = %d },'
+                            % (toml_string(item["battery"]), stretch))
                 continue
             painted = dict(item)
             painted["fill"] = self.palette.color(item["fill"], "surface")
@@ -1596,10 +1999,26 @@ class TouchBar:
             fields = ["Icon = %s" % toml_string(name or "search")]
             fields.append("IconWidth = %d" % int(width))
             fields.append("IconHeight = %d" % BAR_HEIGHT)
+            if stretch != 1:
+                fields.append("Stretch = %d" % stretch)
             rows.append("    { %s }," % ", ".join(fields))
         return emit(settings, rows)
 
-    def render(self):
+    @staticmethod
+    def hit_regions(specs, actions):
+        return [
+            {"left": left, "right": left + width, "index": index,
+             "action": actions[index] if index < len(actions) else None}
+            for index, (left, width) in enumerate(layout_metrics(specs))
+        ]
+
+    def action_at_pixel(self, pixel_x):
+        for region in self.touch_regions:
+            if region["left"] <= pixel_x <= region["right"]:
+                return region["index"], region["action"]
+        return None, None
+
+    def render(self, allow_animation=True):
         with self.lock:
             self.reload_if_changed()
             specs = self.specs()
@@ -1608,11 +2027,12 @@ class TouchBar:
                 or ("keys:%s" % item["keys"] if item.get("keys") else None)
                 for item in specs
             ]
+            hit_regions = self.hit_regions(specs, actions)
             changed = [
                 i for i, item in enumerate(specs)
                 if i >= len(self.prev_specs) or self.prev_specs[i] != item
             ]
-            animate = bool(changed) and bool(self.prev_specs) \
+            animate = bool(allow_animation) and bool(changed) and bool(self.prev_specs) \
                 and self.config["settings"].get("animate", True) \
                 and self.voice_state not in ("recording", "transcribing") \
                 and not (self.claude is not None and self.claude.busy)
@@ -1622,32 +2042,34 @@ class TouchBar:
         if animate:
             threading.Thread(
                 target=self._animate,
-                args=(generation, specs, changed, actions), daemon=True
+                args=(generation, specs, changed, actions, hit_regions), daemon=True
             ).start()
         else:
-            self.queue(self.to_toml(specs), actions=actions)
+            self.queue(self.to_toml(specs), actions=actions,
+                       hit_regions=hit_regions)
 
-    def _animate(self, generation, specs, changed, actions):
+    def _animate(self, generation, specs, changed, actions, hit_regions):
         """Pop the buttons that changed. Frames are whole repaints, so this
         costs three reloads regardless of how many buttons moved."""
         for scale in ANIMATION_FRAMES:
             if generation != self.generation:
                 return
             self.queue(self.to_toml(specs, {i: scale for i in changed}),
-                       generation, actions)
+                       generation, actions, hit_regions)
             time.sleep(ANIMATION_STEP)
-        self.queue(self.to_toml(specs), generation, actions)
+        self.queue(self.to_toml(specs), generation, actions, hit_regions)
 
-    def queue(self, text, generation=None, actions=None):
+    def queue(self, text, generation=None, actions=None, hit_regions=None):
         with self.write_lock:
             if generation is not None and generation != self.generation:
                 return
-            if text == self.last_written:
+            if text == self.last_written and actions == self.touch_actions:
                 return
             if self.pending is None:
                 self.pending_since = time.monotonic()
             self.pending = text
             self.pending_actions = actions
+            self.pending_hit_regions = hit_regions
         self.flush()
 
     def touch_settled(self):
@@ -1664,6 +2086,7 @@ class TouchBar:
                 return
             text, self.pending = self.pending, None
             actions, self.pending_actions = self.pending_actions, None
+            regions, self.pending_hit_regions = self.pending_hit_regions, None
             self.pending_since = 0.0
             try:
                 # In place, not an atomic rename: tiny-dfr watches this inode.
@@ -1673,6 +2096,8 @@ class TouchBar:
                 self.last_change = time.monotonic()
                 if actions is not None:
                     self.touch_actions = actions
+                if regions is not None:
+                    self.touch_regions = regions
             except OSError as exc:
                 sys.stderr.write("omarchy-touchbar: cannot write %s: %s\n" % (DFR_CONFIG, exc))
 
@@ -1724,12 +2149,70 @@ class TouchBar:
                                "chatgpt_thinking": self.chatgpt_thinking,
                                "chatgpt_usage": self.chatgpt_usage,
                                "chatgpt_stats": self.chatgpt_stats,
+                               "browser_tabs": len(self.browser.tabs),
+                               "browser_selected": self.browser.selected,
+                               "browser_offset": self.browser_offset,
                                "fn_down": self.fn_down,
                                "last_touch": self.last_touch})
         return "unknown command"
 
     def active_window(self):
         return hypr("activewindow") or {}
+
+    def focus_browser_tab(self, target):
+        count = len(self.browser.tabs)
+        if not (0 <= target < count):
+            return
+        current = min(self.browser.selected, count - 1)
+        self.browser.selected = target       # immediate active underline
+        self.browser_user_paging_until = 0.0
+        self.render(allow_animation=False)
+
+        def type_switch():
+            if target < 8:
+                args = wtype_args("CTRL+%d" % (target + 1))
+                if args:
+                    subprocess.run(["wtype"] + args, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, check=False)
+                return
+            if target == count - 1:
+                args = wtype_args("CTRL+9")
+                if args:
+                    subprocess.run(["wtype"] + args, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, check=False)
+                return
+            forward = (target - current) % count
+            backward = (current - target) % count
+            chord = "CTRL+PAGEDOWN" if forward <= backward else "CTRL+PAGEUP"
+            repeats = min(forward, backward)
+            args = wtype_args(chord)
+            for _ in range(repeats):
+                if args:
+                    subprocess.run(["wtype"] + args, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, check=False)
+                    time.sleep(0.025)
+
+        threading.Thread(target=type_switch, daemon=True).start()
+
+    def handle_swipe(self, direction):
+        """Page the live tab strip while leaving the focused tab untouched."""
+        if not self.browser_active or self.browser_capacity <= 0:
+            return False
+        last_page = ((max(1, len(self.browser.tabs)) - 1)
+                     // self.browser_capacity) * self.browser_capacity
+        before = self.browser_offset
+        if direction == "left":
+            self.browser_offset = min(last_page,
+                                      self.browser_offset + self.browser_capacity)
+        else:
+            self.browser_offset = max(0, self.browser_offset - self.browser_capacity)
+        self.browser_user_paging_until = time.monotonic() + 8.0
+        self.browser_marquee = 0
+        if self.browser_offset != before:
+            self.prev_specs = []
+            self.render(allow_animation=False)
+            return True
+        return False
 
     def handle_touch_action(self, action):
         """Dispatch daemon-owned controls directly. No synthetic keyboard
@@ -1757,6 +2240,11 @@ class TouchBar:
             if args:
                 subprocess.Popen(["wtype"] + args, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
+        elif kind == "browser-tab" and value:
+            try:
+                self.focus_browser_tab(int(value))
+            except ValueError:
+                pass
         elif kind == "media":
             if value == "mute":
                 self.media.toggle_mute()
@@ -1869,13 +2357,12 @@ class TouchBar:
 def preview(bar, out="/tmp/omarchy-touchbar-preview.png"):
     """Rasterise the current layout the same way librsvg will on the panel."""
     settings = bar.config["settings"]
-    width = cell_width(int(settings["slots"]))
     radius = int(settings["corner_radius"])
     specs = bar.specs()
     parts = []
-    for index, item in enumerate([{"label": "esc", "fill": "sunken",
-                                   "fg": "muted", "size": 20}] + specs):
-        left = index * (width + BUTTON_SPACING)
+    items = [{"label": "esc", "fill": "sunken",
+              "fg": "muted", "size": 20}] + specs
+    for item, (left, width) in zip(items, layout_metrics(specs)):
         if item.get("spacer") or item.get("time") or item.get("battery"):
             continue
         painted = dict(item)
@@ -2023,6 +2510,8 @@ def watch_touches(bar):
         sys.stderr.write("omarchy-touchbar: no Touch Bar digitizer; repaints are ungated\n")
         return
     raw_x = None
+    start_x = None
+    started_at = 0.0
     while True:
         try:
             with open(path, "rb", buffering=0) as handle:
@@ -2035,20 +2524,35 @@ def watch_touches(bar):
                         raw_x = value
                     if etype == EV_KEY and code == BTN_TOUCH:
                         if value:
+                            if not bar.touch_down:
+                                start_x = raw_x
+                                started_at = time.monotonic()
                             bar.touch_down = True
                         else:
                             bar.touch_down = False
                             bar.touch_released_at = time.monotonic()
                             if raw_x is not None:
-                                cells = int(bar.config["settings"]["slots"]) + 1
-                                width = cell_width(cells - 1)
                                 pixel_x = max(0.0, min(BAR_WIDTH - 0.01,
                                     raw_x / 32767.0 * BAR_WIDTH))
-                                stride = width + BUTTON_SPACING
-                                index = int(pixel_x / stride)
-                                inside = pixel_x - index * stride
-                                if inside <= width and 0 <= index < len(bar.touch_actions):
-                                    action = bar.touch_actions[index]
+                                elapsed = time.monotonic() - started_at
+                                delta = raw_x - start_x if start_x is not None else 0
+                                swiped = abs(delta) >= SWIPE_THRESHOLD_RAW \
+                                    and elapsed <= SWIPE_MAX_SECONDS
+                                if swiped:
+                                    direction = "left" if delta < 0 else "right"
+                                    bar.last_touch = {
+                                        "raw_x": raw_x, "swipe": direction,
+                                        "delta": delta,
+                                    }
+                                    try:
+                                        bar.handle_swipe(direction)
+                                    except Exception as exc:
+                                        sys.stderr.write(
+                                            "omarchy-touchbar: swipe failed: %s\n" % exc)
+                                else:
+                                    index, action = bar.action_at_pixel(pixel_x)
+                                    if index is None:
+                                        continue
                                     bar.last_touch = {
                                         "raw_x": raw_x, "slot": index,
                                         "action": action,
@@ -2078,6 +2582,22 @@ def watch_media(bar):
             was_active = bar.media.active
             bar.render()          # transport appeared or disappeared
         time.sleep(1.5)
+
+
+def watch_browser(bar):
+    """Refresh live tabs and advance long-title marquee frames."""
+    while True:
+        active = bar.active_window()
+        profile = bar.profile_for(active)
+        if profile.get("name") == "Browser" and bar.page == "auto":
+            changed = bar.browser.refresh(active)
+            if changed:
+                bar.browser_marquee = 0
+                bar.render(allow_animation=False)
+            elif bar.browser_active and bar.browser_has_marquee:
+                bar.browser_marquee += 1
+                bar.render(allow_animation=False)
+        time.sleep(BROWSER_POLL)
 
 
 def keep_awake(bar):
@@ -2408,6 +2928,7 @@ def run_daemon():
     threading.Thread(target=watch_claude, args=(bar,), daemon=True).start()
     threading.Thread(target=keep_awake, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_media, args=(bar,), daemon=True).start()
+    threading.Thread(target=watch_browser, args=(bar,), daemon=True).start()
     threading.Thread(target=serve, args=(bar,), daemon=True).start()
     bar.render()
     watch_hyprland(bar)
