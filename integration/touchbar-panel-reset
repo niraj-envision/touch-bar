@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Rebind the Touch Bar display driver after resume.
+#
+# After suspend the T2's display endpoint (USB 05ac:8302, driver appletbdrm)
+# can come back wedged: every DRM flush times out with "Failed to send
+# message (-110)" and the panel freezes on its last frame while touch input
+# keeps working, so the bar looks hung even though the daemon and tiny-dfr
+# are fine. Rebinding the interface clears it. tiny-dfr holds the DRM device
+# open (and is bound to it via BindsTo), so it is stopped around the rebind.
+set -u
+
+driver=/sys/bus/usb/drivers/appletbdrm
+[[ -d $driver ]] || exit 0
+
+shopt -s nullglob
+interfaces=("$driver"/*:*)
+[[ ${#interfaces[@]} -gt 0 ]] || exit 0
+
+systemctl stop tiny-dfr.service 2>/dev/null || true
+for path in "${interfaces[@]}"; do
+  iface=$(basename "$path")
+  echo "$iface" > "$driver/unbind" 2>/dev/null || true
+  sleep 1
+  echo "$iface" > "$driver/bind" 2>/dev/null || true
+done
+systemctl start tiny-dfr.service 2>/dev/null || true
+exit 0

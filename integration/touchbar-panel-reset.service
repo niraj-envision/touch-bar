@@ -1,0 +1,12 @@
+[Unit]
+Description=Rebind the Touch Bar display after resume
+# Pulled in when the system suspends; After= delays the actual run until
+# systemd-suspend.service finishes, i.e. immediately after resume.
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/touchbar-panel-reset
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

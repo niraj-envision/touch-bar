@@ -81,6 +81,17 @@ if [[ ! -e $backlight_rule ]]; then
   sudo chmod g+w /sys/class/backlight/appletb_backlight/brightness
 fi
 
+panel_reset=/usr/local/lib/touchbar-panel-reset
+if [[ ! -e $panel_reset ]] \
+    || ! cmp -s "$project_dir/integration/touchbar-panel-reset" "$panel_reset"; then
+  echo "Installing the post-resume Touch Bar display reset (sudo required)."
+  sudo install -m 0755 "$project_dir/integration/touchbar-panel-reset" "$panel_reset"
+  sudo install -m 0644 "$project_dir/integration/touchbar-panel-reset.service" \
+    /etc/systemd/system/touchbar-panel-reset.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable touchbar-panel-reset.service
+fi
+
 python3 -m py_compile "$user_bin/omarchy-touchbar" "$user_bin/omarchy-chatgpt-dictate"
 python3 -c 'import tomllib, pathlib; tomllib.loads(pathlib.Path.home().joinpath(".config/omarchy/touchbar.toml").read_text())'
 
