@@ -43,7 +43,11 @@ autostart="$hypr_config/autostart.lua"
 touch "$autostart"
 if ! grep -Fq 'omarchy-touchbar daemon' "$autostart"; then
   printf '\n-- Context-aware T2 MacBook Touch Bar.\n' >> "$autostart"
-  printf 'o.launch_on_start(os.getenv("HOME") .. "/.local/bin/omarchy-touchbar daemon")\n' >> "$autostart"
+  printf 'o.launch_on_start("systemd-run --user --unit=omarchy-touchbar --collect " .. os.getenv("HOME") .. "/.local/bin/omarchy-touchbar daemon")\n' >> "$autostart"
+elif ! grep -Fq 'systemd-run --user --unit=omarchy-touchbar' "$autostart"; then
+  # Migrate a pre-unit install: a bare launch_on_start daemon escapes both the
+  # omarchy-touchbar.service unit and its single-instance guard.
+  sed -i 's|o.launch_on_start(os.getenv("HOME") .. "/.local/bin/omarchy-touchbar daemon")|o.launch_on_start("systemd-run --user --unit=omarchy-touchbar --collect " .. os.getenv("HOME") .. "/.local/bin/omarchy-touchbar daemon")|' "$autostart"
 fi
 
 bindings="$hypr_config/bindings.lua"
@@ -96,6 +100,8 @@ python3 -m py_compile "$user_bin/omarchy-touchbar" "$user_bin/omarchy-chatgpt-di
 python3 -c 'import tomllib, pathlib; tomllib.loads(pathlib.Path.home().joinpath(".config/omarchy/touchbar.toml").read_text())'
 
 systemctl --user stop omarchy-touchbar.service 2>/dev/null || true
+# Also reap any daemon launched outside the unit (pre-unit autostart entries).
+pkill -f "$user_bin/omarchy-touchbar daemon" 2>/dev/null || true
 systemd-run --user --unit=omarchy-touchbar --collect "$user_bin/omarchy-touchbar" daemon >/dev/null
 sudo systemctl restart tiny-dfr
 hyprctl reload >/dev/null
