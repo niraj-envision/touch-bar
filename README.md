@@ -19,6 +19,8 @@ full-height, animated interface that follows the focused app.
   model rate-limit gauges with reset countdowns, context gauge, expandable to
   full session stats, with model and effort switchable from the panel
 - Animated SVG buttons colored from the active Omarchy theme
+- Full-panel Premier League goal celebrations with a ball-to-net flight,
+  scorer, match clock, and current score
 - Window launcher, media/function layer, app dock, and live battery/clock options
 - Touch-safe rendering that prevents `tiny-dfr` reloads while a finger is down
 - Full-height touch targets: every tap is resolved by the daemon from the raw
@@ -81,6 +83,18 @@ Edit `~/.config/omarchy/touchbar.toml` to tune profiles, icons, colors, buttons,
 workspace count, brightness, clock, battery, and animation settings. Saving it
 triggers a live repaint.
 
+## Football goal celebrations
+
+When the [Football](https://github.com/niraj-envision/football) plugin observes
+a new Premier League goal, the controller temporarily uses all 13 stable Touch
+Bar cells as one continuous stadium scene. The ball flies into the net, then
+the scorer and exact score remain visible for a total of five seconds.
+
+Delivery is durable and serial: the football app records goals on disk, this
+daemon acknowledges each one only after it has finished displaying, and goals
+that arrive together are shown FIFO without overlap. Restarting the daemon may
+replay an interrupted alert, but it cannot silently lose it.
+
 ## Claude Code
 
 When a `claude` process is running under the focused window, the bar switches to
@@ -120,8 +134,9 @@ claude_weekly_budget = 500000000   # tokens; 0 disables the gauge
 
 `tiny-dfr` watches `/etc/tiny-dfr/config.toml`. The daemon watches Hyprland,
 the raw Touch Bar digitizer, focused applications, Omarchy theme state,
-Voxtype, Claude session logs, and Codex/ChatGPT activity. It generates colored
-SVG controls and writes a stable 13-button layout to `tiny-dfr`.
+the football goal inbox, Voxtype, Claude session logs, and Codex/ChatGPT
+activity. It generates colored SVG controls and writes a stable 13-button
+layout to `tiny-dfr`.
 
 Workspace, microphone, page, and app-dock controls are dispatched from the raw
 touch surface. They do not use synthetic F-keys, which prevents workspace taps

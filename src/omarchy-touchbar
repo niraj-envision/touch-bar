@@ -22,6 +22,7 @@ come from the current Omarchy theme.
 import calendar
 import base64
 import configparser
+from collections import deque
 import hashlib
 import html
 import glob
@@ -48,6 +49,8 @@ DFR_CONFIG = os.path.join(DFR_DIR, "config.toml")
 GEN_DIR = os.path.join(DFR_DIR, "gen")
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
 SOCK_PATH = os.path.join(RUNTIME, "omarchy-touchbar.sock")
+GOAL_INBOX = os.path.join(HOME, ".local", "state", "omarchy-pl", "touchbar-goals.jsonl")
+GOAL_ACKS = os.path.join(HOME, ".local", "state", "omarchy-pl", "touchbar-goals.acked")
 VOXTYPE_STATE = os.path.join(RUNTIME, "voxtype", "state")
 CHATGPT_DICTATE = os.path.join(HOME, ".local", "bin", "omarchy-chatgpt-dictate")
 HYPR_SIG = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
@@ -1221,8 +1224,37 @@ def layout_metrics(specs):
     return metrics
 
 
+def build_goal_svg(spec, width, font):
+    """Crop one cell out of a continuous 2170x60 stadium goal scene."""
+    g = spec["goal_scene"]
+    left = float(spec.get("scene_x", 0))
+    progress = max(0.0, min(1.0, float(g.get("progress", 1))))
+    flight = min(1.0, progress / .62)
+    ball_x = 560 + 1370 * flight
+    ball_y = 38 - 25 * (4 * flight * (1 - flight))
+    pulse = max(0.0, 1.0 - abs(progress - .68) / .15)
+    fg, bg = spec.get("fg", "#ffffff"), spec.get("fill", "#111111")
+    accent = spec.get("bar", "#75b798")
+    red = spec.get("goal_red", "#f06c75")
+    scorer = html.escape(str(g.get("scorer") or "GOAL"))
+    score = html.escape("%s  %s - %s  %s" % (
+        g.get("homeAbbr", "HOME"), g.get("homeScore", 0),
+        g.get("awayScore", 0), g.get("awayAbbr", "AWAY")))
+    clock = html.escape(str(g.get("clock") or "LIVE"))
+    team = html.escape(str(g.get("team") or ""))
+    return '''<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="60" viewBox="%.2f 0 %.2f 60">
+      <defs><linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop stop-color="%s"/><stop offset="1" stop-color="#050708"/></linearGradient><radialGradient id="light"><stop stop-color="%s" stop-opacity=".9"/><stop offset="1" stop-color="%s" stop-opacity="0"/></radialGradient><filter id="glow"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+      <rect width="2170" height="60" fill="url(#sky)"/><ellipse cx="1085" cy="17" rx="900" ry="30" fill="url(#light)" opacity=".28"/><path d="M0 46 Q540 37 1085 45 T2170 43 V60 H0Z" fill="%s" opacity=".35"/><path d="M0 51 H2170" stroke="%s" stroke-width="1" opacity=".25"/>
+      <g opacity=".72" stroke="%s" fill="none"><path d="M1950 15h145v38h-145z" stroke-width="3"/><path d="M1950 15l28 9h145l-28-9M2095 15l28 9v29"/><path d="M1978 24v29m24-29v29m24-29v29m24-29v29m24-29v29M1950 34h173m-173 10h173" opacity=".42"/></g>
+      <circle cx="%.1f" cy="%.1f" r="7" fill="#faf7ef" stroke="#242424" stroke-width="2" filter="url(#glow)"/><path d="M%.1f %.1f l4 2 -2 4 -5-1 -1-4z" fill="#242424"/><circle cx="1995" cy="35" r="%.1f" fill="none" stroke="%s" stroke-width="3" opacity="%.2f"/>
+      <g font-family="%s" text-anchor="middle"><text x="1060" y="19" font-size="13" font-weight="700" fill="%s" letter-spacing="3">GOAL · %s</text><text x="1060" y="43" font-size="25" font-weight="800" fill="%s">%s</text><text x="1060" y="57" font-size="12" font-weight="700" fill="%s">%s · %s</text></g>
+    </svg>''' % (int(width), left, width, bg, accent, bg, accent, fg, fg, ball_x, ball_y, ball_x, ball_y, 12 + 38 * pulse, red, .75 * pulse, font, red, clock, fg, score, accent, scorer, team)
+
+
 def build_svg(spec, width, radius, font, scale=1.0):
     """One button, drawn edge to edge so we own every pixel of it."""
+    if spec.get("goal_scene"):
+        return build_goal_svg(spec, width, font)
     label = html.escape(spec.get("label", ""))
     size = spec.get("size", 26)
     caption = html.escape(str(spec.get("sub") or ""))
@@ -1500,6 +1532,9 @@ class TouchBar:
         self.browser_has_marquee = False
         self.browser_active = False
         self.browser_user_paging_until = 0.0
+        self.goal_queue = deque()
+        self.goal_active = None
+        self.goal_animating = False
         # Animation frames arrive several times a second; each render used to
         # cost four Hyprland IPC round-trips. Cache the compositor state and
         # let the event watcher invalidate it, so polling threads ride the
@@ -2287,6 +2322,66 @@ class TouchBar:
         ]
         return self.compose([rows], self.mode_group())
 
+    def goal_specs(self, payload, progress=1.0):
+        count = int(self.config["settings"]["slots"])
+        metrics = layout_metrics([BLANK] * count)[1:]
+        return [spec("", None, fill="darker_background", fg="bright_foreground",
+                     gloss=False, goal_scene=dict(payload, progress=progress),
+                     scene_x=left, bar="accent", goal_red="red")
+                for left, _width in metrics]
+
+    def enqueue_goal(self, payload):
+        with self.lock:
+            identity = payload.get("id")
+            if identity and (identity == (self.goal_active or {}).get("id") or
+                             any(identity == g.get("id") for g in self.goal_queue)):
+                return
+            self.goal_queue.append(payload)
+            if self.goal_animating:
+                return
+            self.goal_animating = True
+        threading.Thread(target=self._goal_worker, daemon=True).start()
+
+    @staticmethod
+    def ack_goal(payload):
+        identity = payload.get("id")
+        if not identity:
+            return
+        try:
+            os.makedirs(os.path.dirname(GOAL_ACKS), exist_ok=True)
+            with open(GOAL_ACKS, "a") as handle:
+                handle.write(identity + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            pass
+
+    def _goal_worker(self):
+        while True:
+            with self.lock:
+                if not self.goal_queue:
+                    self.goal_active = None
+                    self.goal_animating = False
+                    self.last_written = None
+                    self.prev_specs = []
+                    break
+                self.goal_active = self.goal_queue.popleft()
+                payload = dict(self.goal_active)
+                self.generation += 1
+            started = time.monotonic()
+            for frame_no in range(19):
+                progress = frame_no / 18.0
+                specs = self.goal_specs(payload, progress)
+                self.queue(self.to_toml(specs), actions=[None] * 14,
+                           hit_regions=self.hit_regions(specs, [None] * 14))
+                target = started + progress * 1.25
+                time.sleep(max(0, target - time.monotonic()))
+            end = started + 5.0
+            while time.monotonic() < end:
+                time.sleep(min(.1, max(0, end - time.monotonic())))
+            self.ack_goal(payload)       # durable acknowledgement after display
+        self.render(allow_animation=False)
+
     def specs(self):
         self.browser_active = False
         if self.page == "fn":
@@ -2333,6 +2428,8 @@ class TouchBar:
             painted["fg"] = self.palette.color(item["fg"], "fg")
             painted["badge_fill"] = self.palette.color("sunken")
             painted["badge_fg"] = self.palette.color("fg")
+            if item.get("goal_red"):
+                painted["goal_red"] = self.palette.color(item["goal_red"], "red")
             for field, fallback in (("bar", "accent"), ("track", "sunken"),
                                     ("sub_fg", "muted")):
                 if item.get(field):
@@ -2373,6 +2470,8 @@ class TouchBar:
     def render(self, allow_animation=True):
         with self.lock:
             self.reload_if_changed()
+            if self.goal_active is not None:
+                return
             specs = self.specs()
             actions = [None] + [
                 item.get("daemon")
@@ -2489,6 +2588,13 @@ class TouchBar:
                 return "cleared"
             self.toggle_voice()
             return self.voice_state
+        if verb == "goal":
+            try:
+                payload = json.loads(base64.urlsafe_b64decode(args[0] + "===").decode())
+            except Exception:
+                return "usage: goal BASE64_JSON"
+            self.enqueue_goal(payload)
+            return "queued"
         if verb == "render":
             self.last_written = None
             self.prev_specs = []
@@ -2505,7 +2611,9 @@ class TouchBar:
                                "browser_selected": self.browser.selected,
                                "browser_offset": self.browser_offset,
                                "fn_down": self.fn_down,
-                               "last_touch": self.last_touch})
+                               "last_touch": self.last_touch,
+                               "goal_active": self.goal_active,
+                               "goal_queue": len(self.goal_queue)})
         return "unknown command"
 
     def active_window(self, max_age=0.3):
@@ -3369,6 +3477,35 @@ def restore_static():
         pass
 
 
+def watch_goals(bar):
+    """Replay every unacknowledged goal; never remove before it is displayed."""
+    while True:
+        events = []
+        try:
+            try:
+                with open(GOAL_ACKS) as handle:
+                    acked = {line.strip() for line in handle if line.strip()}
+            except OSError:
+                acked = set()
+            try:
+                with open(GOAL_INBOX) as handle:
+                    lines = handle.readlines()
+            except OSError:
+                lines = []
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                    if event.get("kind") == "goal" and event.get("id") not in acked:
+                        events.append(event)
+                except (TypeError, ValueError):
+                    continue
+        except OSError:
+            pass
+        for event in events:
+            bar.enqueue_goal(event)
+        time.sleep(.35)
+
+
 def run_daemon():
     bar = TouchBar(clear_cache=True)
 
@@ -3389,6 +3526,7 @@ def run_daemon():
     threading.Thread(target=watch_media, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_system, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_browser, args=(bar,), daemon=True).start()
+    threading.Thread(target=watch_goals, args=(bar,), daemon=True).start()
     threading.Thread(target=serve, args=(bar,), daemon=True).start()
     bar.render()
     watch_hyprland(bar)
