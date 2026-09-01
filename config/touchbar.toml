@@ -84,7 +84,6 @@ name = "Claude Code"
 # in any terminal. The title match is only a fallback.
 claude = true
 match_title = "^✳"
-voice_backend = "claude"
 icon = "󰚩"
 icon_color = "orange"
 collapse_workspaces = true
@@ -152,7 +151,6 @@ buttons = [
 [[profiles]]
 name = "ChatGPT"
 match = "^(chatgpt|ChatGPT)$"
-voice_backend = "chatgpt"
 show_identity = false
 icon = "󰭹"
 icon_color = "green"

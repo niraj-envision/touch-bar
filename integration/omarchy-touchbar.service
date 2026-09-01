@@ -1,0 +1,14 @@
+[Unit]
+Description=Omarchy T2 Touch Bar daemon
+Documentation=https://github.com/niraj-envision/touch-bar
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omarchy-touchbar daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -27,6 +27,7 @@ import hashlib
 import html
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -52,7 +53,8 @@ SOCK_PATH = os.path.join(RUNTIME, "omarchy-touchbar.sock")
 GOAL_INBOX = os.path.join(HOME, ".local", "state", "omarchy-pl", "touchbar-goals.jsonl")
 GOAL_ACKS = os.path.join(HOME, ".local", "state", "omarchy-pl", "touchbar-goals.acked")
 VOXTYPE_STATE = os.path.join(RUNTIME, "voxtype", "state")
-CHATGPT_DICTATE = os.path.join(HOME, ".local", "bin", "omarchy-chatgpt-dictate")
+VOXTYPE_AUDIO = os.path.join(RUNTIME, "voxtype", "audio.sock")
+AUDIO_LEVEL_FRAME = struct.Struct("=Ifff")
 HYPR_SIG = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
 HYPR_DIR = os.path.join(RUNTIME, "hypr", HYPR_SIG)
 
@@ -772,6 +774,8 @@ class SystemStats:
         self.brightness = None                    # screen backlight, 0-100
         self.kbd = None                           # keyboard backlight, 0-100
         self.volume = None                        # (percent, muted)
+        self.last_screen = 50                     # restore target after screen-off
+        self.last_kbd = 50                        # restore target after keyboard-off
         temp_dir = hwmon_by_name("coretemp")
         self._temp_path = os.path.join(temp_dir, "temp1_input") if temp_dir else None
         self._fan_dir = None
@@ -868,6 +872,10 @@ class SystemStats:
         self.controls_checked = now
         self.brightness = self._level(self._backlight_dir)
         self.kbd = self._level(self._kbd_dir)
+        if self.brightness:
+            self.last_screen = self.brightness
+        if self.kbd:
+            self.last_kbd = self.kbd
         try:
             out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
                                  capture_output=True, text=True, timeout=2).stdout
@@ -1342,9 +1350,40 @@ def build_svg(spec, width, radius, font, scale=1.0):
     else:
         body = None
 
+    waveform = spec.get("waveform")
     bars = spec.get("bars")
     if body is not None:
         pass
+    elif waveform:
+        # Voxtype provides the real minimum and maximum sample values for
+        # every frame. Render their envelope so the waveform rises and falls
+        # above and below the centre line instead of becoming flat dots.
+        pad, centre, half_height = 22.0, BAR_HEIGHT / 2.0, 23.0
+        count = len(waveform)
+        step = (width - pad * 2) / max(1, count - 1)
+        upper, lower = [], []
+        for index, (minimum, maximum) in enumerate(waveform):
+            x = pad + index * step
+            low = max(-1.0, min(0.0, float(minimum)))
+            high = min(1.0, max(0.0, float(maximum)))
+            upper.append((x, centre - high * half_height))
+            lower.append((x, centre - low * half_height))
+        upper_points = " ".join("%.2f,%.2f" % point for point in upper)
+        lower_points = " ".join("%.2f,%.2f" % point for point in lower)
+        envelope = upper_points + " " + " ".join(
+            "%.2f,%.2f" % point for point in reversed(lower))
+        wave_color = spec.get("fg", "#d4be98")
+        body = (
+            '<line x1="%.2f" y1="%.2f" x2="%.2f" y2="%.2f" '
+            'stroke="%s" stroke-width="1" opacity="0.22"/>'
+            '<polygon points="%s" fill="%s" opacity="0.24"/>'
+            '<polyline points="%s" fill="none" stroke="%s" '
+            'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>'
+            '<polyline points="%s" fill="none" stroke="%s" '
+            'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>'
+            % (pad, centre, width - pad, centre, wave_color, envelope,
+               wave_color, upper_points, wave_color, lower_points, wave_color)
+        )
     elif bars:
         count = len(bars)
         bar_w, gap = 7.0, 5.0
@@ -1505,14 +1544,20 @@ class TouchBar:
         self.last_touch = None
         self.touch_down = False
         self.touch_released_at = 0.0
-        # A config write resets tiny-dfr to its primary layer. Hold every
-        # repaint while the physical Fn key exposes the classic media layer.
+        # Fn is a momentary hardware key but a tap toggles our own settings
+        # dashboard. Writes still wait for key-up so tiny-dfr never swaps a
+        # layout beneath the physical media layer mid-press.
         self.fn_down = False
+        self.fn_overlay_return = None
         self.voice_state = "idle"
         self.voice_backend = None
         self.voice_target = None
         self.voice_phase = 0
         self.review_until = 0.0
+        self.voice_level_lock = threading.Lock()
+        self.voice_levels = deque([(0.0, 0.0)] * 61, maxlen=61)
+        self.voice_peak = 0.0
+        self.voice_peak_dbfs = -120.0
         self.chatgpt_stats = {}
         self.chatgpt_thinking = False
         self.chatgpt_usage = None
@@ -1872,34 +1917,79 @@ class TouchBar:
         return [spec(glyph, None, fill="sunken", fg=color, size=28, glow=True)]
 
     def voice_backend_for(self, active_win):
-        profile = self.profile_for(active_win)
-        if profile.get("voice_backend"):
-            return profile["voice_backend"]
-        if re.search(r"^(chatgpt|ChatGPT)$", (active_win or {}).get("class", "")):
-            return "chatgpt"
+        # Keep dictation visually and functionally inside the Touch Bar for
+        # every focused application; native app recorders create a duplicate
+        # main-window UI instead of supplying our audio envelope.
         return "voxtype"
 
     def voice_group(self):
-        """Mic plus post-dictation controls. F22 is the stateful mic; F21
-        clears the current input through the daemon so it can send a sequence."""
-        if self.voice_state == "recording":
-            colors = ("red", "magenta", "orange")
-            return [spec("󰍬", None, fill=colors[self.voice_phase % len(colors)],
-                         fg="on_accent", size=29, glow=True,
-                         daemon="voice:toggle")]
-        if self.voice_state == "transcribing":
-            return [spec("", None, fill="yellow", fg="on_accent",
-                         size=27, glow=True)]
-        if self.voice_state == "review":
-            return [
-                spec("", "Enter", fill="green", fg="on_accent", size=26),
-                spec("", None, fill="red", fg="on_accent", size=25,
-                     daemon="voice:clear"),
-                spec("", None, fill="accent", fg="on_accent", size=25,
-                     daemon="voice:toggle"),
-            ]
+        """A compact launcher; active dictation owns the full Touch Bar."""
+        if self.voice_state != "idle":
+            return []
         return [spec("", None, fill="sunken", fg="magenta", size=27,
                      daemon="voice:toggle")]
+
+    def voice_overlay(self):
+        """Full-width, Touch-Bar-only dictation interface."""
+        if self.voice_state == "recording":
+            with self.voice_level_lock:
+                wave = tuple(self.voice_levels)
+                peak = self.voice_peak
+            color = "red" if peak >= 0.92 else \
+                "yellow" if peak >= 0.70 else "cyan"
+            return [
+                spec("●", None, fill="raised", fg="red", size=25,
+                     sub="LIVE MIC", sub_size=10, glow=False,
+                     daemon="voice:pause"),
+                spec("", None, fill="sunken", fg=color, gloss=False,
+                     glow=False, waveform=wave, stretch=9,
+                     daemon="voice:pause"),
+                spec("", None, fill="raised", fg="yellow", size=25,
+                     sub="stop", sub_size=11, daemon="voice:pause"),
+                spec("󰆴", None, fill="sunken", fg="red", size=28,
+                     sub="delete", sub_size=11, daemon="voice:delete"),
+            ]
+        if self.voice_state == "transcribing":
+            return [
+                spec(SPINNER[self.voice_phase % len(SPINNER)], None,
+                     fill="sunken", fg="yellow", size=31, glow=False,
+                     sub="transcribing", sub_size=13, stretch=11),
+                spec("󰆴", None, fill="sunken", fg="red", size=28,
+                     sub="cancel", sub_size=11, daemon="voice:delete"),
+            ]
+        return [
+            spec("󰏤", None, fill="sunken", fg="muted", size=29,
+                 sub="paused", sub_size=12, stretch=9),
+            spec("󰍬", None, fill="raised", fg="magenta", size=29,
+                 sub="add", sub_size=11, daemon="voice:add"),
+            spec("󰒊", None, fill="green", fg="on_accent", size=29,
+                 sub="send", sub_size=11, daemon="voice:send"),
+            spec("󰆴", None, fill="red", fg="on_accent", size=28,
+                 sub="delete", sub_size=11, daemon="voice:delete"),
+        ]
+
+    def reset_voice_meter(self):
+        with self.voice_level_lock:
+            self.voice_levels.clear()
+            self.voice_levels.extend([(0.0, 0.0)] * self.voice_levels.maxlen)
+            self.voice_peak = 0.0
+            self.voice_peak_dbfs = -120.0
+
+    def ingest_voice_level(self, minimum, maximum, peak_dbfs):
+        """Map a real audio frame to a two-sided, speech-sensitive envelope."""
+        minimum, maximum, peak_dbfs = float(minimum), float(maximum), float(peak_dbfs)
+        strength = (min(1.0, max(0.0, (peak_dbfs + 58.0) / 46.0)) ** 0.72
+                    if math.isfinite(peak_dbfs) else 0.0)
+        sample_peak = max(abs(minimum), abs(maximum))
+        if sample_peak > 1e-9 and strength > 0.0:
+            low = -strength * min(1.0, abs(minimum) / sample_peak)
+            high = strength * min(1.0, abs(maximum) / sample_peak)
+        else:
+            low, high = 0.0, 0.0
+        with self.voice_level_lock:
+            self.voice_levels.append((low, high))
+            self.voice_peak = min(1.0, max(strength, self.voice_peak * 0.97))
+            self.voice_peak_dbfs = peak_dbfs
 
     def tab_group(self, profile):
         """Static fallback for non-Firefox browsers or a missing session."""
@@ -2041,6 +2131,17 @@ class TouchBar:
             rows.extend(group[: max(0, budget - len(rows))])
         rows.extend(BLANK for _ in range(budget - len(rows)))
         return rows + trailing
+
+    def toggle_fn_dashboard(self):
+        """A Fn tap opens the hardware dashboard; the next one restores UI."""
+        if self.page == "settings":
+            self.page = self.fn_overlay_return or "auto"
+            self.fn_overlay_return = None
+        else:
+            self.fn_overlay_return = self.page if self.page in PAGES else "auto"
+            self.page = "settings"
+        self.prev_specs = []
+        self.render(allow_animation=False)
 
     def page_auto(self):
         clients, workspaces, active_ws, active_win = self.snapshot()
@@ -2292,33 +2393,28 @@ class TouchBar:
         return self.compose([rows], self.mode_group())
 
     def page_settings(self):
-        """Screen brightness, volume, and keyboard backlight, adjusted in place."""
+        """Mac-style hardware controls: icons only, no old metric gauges."""
         stats = self.stats
         stats.refresh_controls(interval=1.0)
 
-        def level(value, caption, color):
-            return spec("--" if value is None else "%d%%" % value, None,
-                        fill="sunken", fg=color, size=20, gloss=False,
-                        sub=caption, gauge=(value or 0) / 100.0, bar=color,
-                        track="darker_background")
-
-        def button(glyph, action, color="fg"):
-            return spec(glyph, None, fill="surface", fg=color, size=24,
-                        daemon="sys:%s" % action)
+        def button(glyph, action, color="fg", size=28):
+            return spec(glyph, None, fill="surface", fg=color, size=size,
+                        daemon=action)
 
         muted = bool(stats.volume and stats.volume[1])
-        volume = None if stats.volume is None else stats.volume[0]
         rows = [
-            button("", "bright-"),
-            level(stats.brightness, "\U000f00e0 screen", "yellow"),
-            button("", "bright+"),
-            button("", "vol-"),
-            level(volume, "\U000f057e volume", "muted" if muted else "green"),
-            button("", "vol+"),
-            button("\U000f075f", "mute", "red" if muted else "muted"),
-            button("", "kbd-"),
-            level(stats.kbd, "\U000f030c keyboard", "cyan"),
-            button("", "kbd+"),
+            button("󰃞", "sys:bright-", size=22),
+            button("󰃠", "sys:bright+", size=32),
+            button("󰍹", "sys:bright-toggle", "yellow", 27),
+            button("󰌌", "sys:kbd-", size=21),
+            button("󰌌", "sys:kbd+", size=31),
+            button("󰌐", "sys:kbd-toggle", "cyan", 27),
+            button("󰒮", "media:previous"),
+            button("󰐊", "media:playpause", "green", 29),
+            button("󰒭", "media:next"),
+            button("󰖁", "sys:mute", "red" if muted else "fg"),
+            button("󰕿", "sys:vol-"),
+            button("󰕾", "sys:vol+", size=30),
         ]
         return self.compose([rows], self.mode_group())
 
@@ -2384,6 +2480,8 @@ class TouchBar:
 
     def specs(self):
         self.browser_active = False
+        if self.voice_state != "idle":
+            return self.voice_overlay()
         if self.page == "fn":
             return self.page_fn()
         if self.page == "apps":
@@ -2583,10 +2681,7 @@ class TouchBar:
             return "empty slot"
         if verb == "voice":
             action = args[0] if args else "toggle"
-            if action == "clear":
-                self.clear_dictation()
-                return "cleared"
-            self.toggle_voice()
+            self.voice_action(action)
             return self.voice_state
         if verb == "goal":
             try:
@@ -2733,16 +2828,33 @@ class TouchBar:
         elif kind == "sys" and value:
             self.system_control(value)
         elif kind == "voice":
-            self.clear_dictation() if value == "clear" else self.toggle_voice()
+            self.voice_action(value or "toggle")
         elif kind == "focus" and value:
             hypr('dispatch hl.dsp.focus({ window = "address:%s" })' % value,
                  as_json=False)
             self.invalidate_state()
 
     def system_control(self, value):
-        """Adjust one of the settings-page levels, then show the new value."""
+        """Adjust icon-only hardware controls without showing metric tiles."""
         stats = self.stats
+        stats.refresh_controls(interval=0.0)
         screen, kbd = stats.backlight_device, stats.kbd_device
+        if value == "bright-toggle" and screen:
+            if stats.brightness:
+                stats.last_screen = stats.brightness
+                command = ["brightnessctl", "-d", screen, "s", "0%"]
+            else:
+                command = ["brightnessctl", "-d", screen, "s",
+                           "%d%%" % max(5, stats.last_screen)]
+        elif value == "kbd-toggle" and kbd:
+            if stats.kbd:
+                stats.last_kbd = stats.kbd
+                command = ["brightnessctl", "-d", kbd, "s", "0%"]
+            else:
+                command = ["brightnessctl", "-d", kbd, "s",
+                           "%d%%" % max(1, stats.last_kbd)]
+        else:
+            command = None
         commands = {
             # --min-value keeps a stray tap from turning the screen fully off.
             "bright-": ["brightnessctl", "--min-value=5", "-d", screen,
@@ -2756,7 +2868,7 @@ class TouchBar:
                      "@DEFAULT_AUDIO_SINK@", "5%+"],
             "mute": ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
         }
-        args = commands.get(value)
+        args = command or commands.get(value)
         if not args:
             return
         try:
@@ -2785,72 +2897,66 @@ class TouchBar:
         except OSError as exc:
             sys.stderr.write("omarchy-touchbar: cannot type %r: %s\n" % (command, exc))
 
-    @staticmethod
-    def chatgpt_dictate():
-        """Toggle native ChatGPT dictation. Bounded: this runs on the touch
-        thread, and a hung helper must not take touch handling down with it."""
-        try:
-            return subprocess.run(
-                [CHATGPT_DICTATE], stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=6).returncode == 0
-        except (OSError, subprocess.SubprocessError):
-            return False
-
-    def send_key_state(self, key, state):
-        hypr('dispatch hl.dsp.send_key_state({ key = "%s", state = "%s" })'
-             % (key, state), as_json=False)
-
     def toggle_voice(self):
         active = self.active_window()
         address = active.get("address")
-        backend = self.voice_backend_for(active)
 
         if self.voice_state == "review":
-            self.voice_state = "idle"       # Add more appends at the cursor.
+            self.voice_state = "idle"       # Add more continues at the cursor.
 
         if self.voice_state == "idle":
-            self.voice_backend = backend
+            self.voice_backend = "voxtype"
             self.voice_target = address
             self.review_until = 0.0
-            if backend == "claude":
-                # Claude Code native /voice: hold the default push-to-talk Space
-                # across taps, then release it on the second tap.
-                self.send_key_state("SPACE", "down")
-                self.voice_state = "recording"
-            elif backend == "chatgpt" and self.chatgpt_dictate():
-                self.voice_state = "recording"
-            else:
-                self.voice_backend = "voxtype"
-                subprocess.Popen(["voxtype", "record", "start"],
-                                 stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                self.voice_state = "recording"
+            self.reset_voice_meter()
+            subprocess.Popen(["voxtype", "record", "start"],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            self.voice_state = "recording"
             self.render()
             return
 
         if self.voice_state == "recording":
-            if self.voice_backend == "claude":
-                self.send_key_state("SPACE", "up")
-                self.voice_state = "transcribing"
-                self.finish_native_later()
-            elif self.voice_backend == "chatgpt" and self.chatgpt_dictate():
-                self.voice_state = "transcribing"
-                self.finish_native_later()
-            else:
-                subprocess.Popen(["voxtype", "record", "stop"],
-                                 stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                self.voice_state = "transcribing"
+            subprocess.Popen(["voxtype", "record", "stop"],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            self.voice_state = "transcribing"
             self.render()
 
-    def finish_native_later(self):
-        def finish():
-            time.sleep(2.5)
-            if self.voice_state == "transcribing":
-                self.voice_state = "review"
-                self.review_until = time.monotonic() + 15
+    def voice_action(self, action):
+        """Keep recording, review, send, and deletion fully on the Touch Bar."""
+        action = (action or "toggle").lower()
+        if action in ("toggle", "pause"):
+            if action == "toggle" or self.voice_state == "recording":
+                self.toggle_voice()
+            return
+        if action == "add" and self.voice_state == "review":
+            self.toggle_voice()
+            return
+        if action in ("delete", "clear", "cancel"):
+            if self.voice_state in ("recording", "transcribing"):
+                subprocess.Popen(["voxtype", "record", "cancel"],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                self.voice_state = "idle"
+                self.voice_backend = None
+                self.voice_target = None
+                self.review_until = 0.0
+                self.prev_specs = []
                 self.render()
-        threading.Thread(target=finish, daemon=True).start()
+            else:
+                self.clear_dictation()
+            return
+        if action == "send" and self.voice_state == "review":
+            subprocess.run(["wtype", "-k", "Return"],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False)
+            self.voice_state = "idle"
+            self.voice_backend = None
+            self.voice_target = None
+            self.review_until = 0.0
+            self.prev_specs = []
+            self.render()
 
     def clear_dictation(self):
         if self.voice_state != "review":
@@ -3003,12 +3109,7 @@ def find_digitizer():
 
 
 def watch_fn(bar):
-    """Keep daemon repaints from dismissing tiny-dfr's Fn media layer.
-
-    tiny-dfr handles the physical Fn key itself. We only mirror its held state:
-    config reloads pause on key-down and the newest queued frame lands after
-    key-up. This preserves animations without making media buttons untappable.
-    """
+    """Use a Fn tap as the hardware-dashboard toggle without mid-press reloads."""
     path = find_input_device(KEYBOARD_NAME)
     if not path:
         sys.stderr.write("omarchy-touchbar: no internal keyboard; Fn is ungated\n")
@@ -3029,6 +3130,7 @@ def watch_fn(bar):
                         continue
                     if value == 1:
                         bar.fn_down = True
+                        bar.toggle_fn_dashboard()
                     elif value == 0:
                         bar.fn_down = False
                         bar.touch_released_at = time.monotonic()
@@ -3207,19 +3309,49 @@ def watch_voxtype(bar):
             if state in ("recording", "transcribing"):
                 if bar.voice_backend in (None, "voxtype"):
                     bar.voice_backend = "voxtype"
+                    if state == "recording" and previous != "recording":
+                        bar.reset_voice_meter()
                     bar.voice_state = state
                     if not bar.voice_target:
                         bar.voice_target = bar.active_window().get("address")
                     bar.render()
             elif previous == "transcribing" and bar.voice_backend == "voxtype":
                 bar.voice_state = "review"
-                bar.review_until = time.monotonic() + 15
+                bar.review_until = 0.0
+                bar.prev_specs = []
                 bar.render()
             elif previous == "recording" and bar.voice_backend == "voxtype":
                 bar.voice_state = "idle"
                 bar.render()
             previous = state
         time.sleep(0.08)
+
+
+def watch_voice_levels(bar):
+    """Read Voxtype's 100 Hz min/max microphone frames for the Touch Bar."""
+    while True:
+        try:
+            stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stream.settimeout(3.0)
+            stream.connect(VOXTYPE_AUDIO)
+            stream.settimeout(None)
+            pending = bytearray()
+            with stream:
+                while True:
+                    chunk = stream.recv(4096)
+                    if not chunk:
+                        break
+                    pending.extend(chunk)
+                    while len(pending) >= AUDIO_LEVEL_FRAME.size:
+                        packed = bytes(pending[:AUDIO_LEVEL_FRAME.size])
+                        del pending[:AUDIO_LEVEL_FRAME.size]
+                        _, minimum, maximum, peak_dbfs = \
+                            AUDIO_LEVEL_FRAME.unpack(packed)
+                        if bar.voice_state == "recording":
+                            bar.ingest_voice_level(minimum, maximum, peak_dbfs)
+        except OSError:
+            pass
+        time.sleep(0.5)
 
 
 CODEX_SESSION_CACHE = {}
@@ -3425,7 +3557,7 @@ def animate_live_states(bar):
             bar.chatgpt_phase += 1
             bar.media_phase += 1
             bar.render()
-            time.sleep(0.24)
+            time.sleep(0.12 if bar.voice_state == "recording" else 0.24)
         else:
             if bar.voice_state == "review" and bar.review_until \
                     and time.monotonic() > bar.review_until:
@@ -3519,6 +3651,7 @@ def run_daemon():
     threading.Thread(target=watch_touches, args=(bar,), daemon=True).start()
     threading.Thread(target=drain, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_voxtype, args=(bar,), daemon=True).start()
+    threading.Thread(target=watch_voice_levels, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_chatgpt, args=(bar,), daemon=True).start()
     threading.Thread(target=animate_live_states, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_claude, args=(bar,), daemon=True).start()

@@ -12,8 +12,9 @@ full-height, animated interface that follows the focused app.
   Discord, Obsidian, and general windows
 - Media transport with an animated equaliser wherever something is playing,
   read from MPRIS, with mute
-- Always-available dictation while typing, with recording/transcribing states
-- Native ChatGPT dictation plus Claude-style live model, context, output,
+- Always-available Touch-Bar-only dictation with a real live microphone waveform,
+  Stop/Delete while recording, and Add/Send/Delete after transcription
+- Claude-style live model, context, output,
   turns, tools, elapsed-time, task, and rate-limit telemetry
 - Claude Code read-out: live spinner with the running tool, real session/weekly/
   model rate-limit gauges with reset countdowns, context gauge, expandable to
@@ -26,8 +27,8 @@ full-height, animated interface that follows the focused app.
 - Full-height touch targets: every tap is resolved by the daemon from the raw
   digitizer, so buttons work edge to edge (tiny-dfr's own hit test ignores the
   top and bottom 10% of the panel)
-- Fn-safe rendering that keeps classic brightness, keyboard-light, playback,
-  microphone, search, and volume controls usable for the full key hold
+- Fn toggles the icon-only hardware dashboard without reloading a layout while
+  the physical key is held
 
 ## Requirements
 
@@ -36,8 +37,7 @@ full-height, animated interface that follows the focused app.
 - `tiny-dfr`
 - Python 3.11 or newer
 - `wtype` and `librsvg` (`rsvg-convert`)
-- [Voxtype](https://github.com/omarchy/omarchy) for system dictation fallback
-- Optional: Python GObject/AT-SPI bindings for ChatGPT-native dictation
+- [Voxtype](https://github.com/omarchy/omarchy) for Touch-Bar-only dictation
 
 ## Install
 
@@ -54,10 +54,11 @@ replace it with the repository configuration:
 ./install.sh --force-config
 ```
 
-It installs the executable files in `~/.local/bin`, adds the daemon to
-`~/.config/hypr/autostart.lua`, adds the Omarchy theme hook, and starts the
-user daemon. It may ask for `sudo` only to prepare `/etc/tiny-dfr` and restart
-the system `tiny-dfr` service.
+It installs the executable files in `~/.local/bin`, enables a persistent
+`omarchy-touchbar.service` user unit for every login/reboot, adds a Hyprland
+startup safety check, adds the Omarchy theme hook, and starts the daemon. It
+may ask for `sudo` only to prepare `/etc/tiny-dfr` and restart the system
+`tiny-dfr` service.
 
 ## Commands
 
@@ -67,16 +68,16 @@ omarchy-touchbar render
 omarchy-touchbar page auto
 omarchy-touchbar page workspaces
 omarchy-touchbar page system      # battery, CPU, load, RAM, swap, temp, fans
-omarchy-touchbar page settings    # screen brightness, volume, keyboard backlight
+omarchy-touchbar page settings    # icon-only brightness, keyboard light, media, volume
 omarchy-touchbar page fn
 omarchy-touchbar preview
 ```
 
 The **system** page shows live machine vitals (battery, CPU usage, load, RAM,
 swap, CPU temperature, fan RPM) refreshed every couple of seconds while open.
-The **settings** page adjusts screen brightness, output volume (with mute), and
-keyboard backlight with −/+ buttons; levels come from sysfs and `wpctl`, so
-changes made elsewhere (volume keys) show up live. Both are part of the page
+The **settings** page is the Mac-style icon row: screen brightness and off/on,
+keyboard light and off/on, playback, mute, and output volume. Tap Fn to toggle
+that panel on and off. Both settings and system statistics are part of the page
 cycle on the mode button.
 
 Edit `~/.config/omarchy/touchbar.toml` to tune profiles, icons, colors, buttons,
