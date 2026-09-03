@@ -4,6 +4,8 @@ A context-aware Touch Bar for Intel T2 MacBooks running Omarchy and Hyprland.
 It uses `tiny-dfr` as the renderer and replaces a static function row with a
 full-height, themed interface that follows the focused app.
 
+![Omarchy Touch Bar preview](preview.png)
+
 ## Highlights
 
 - **Follows the app.** Workspace picker with per-workspace app glyphs, live

@@ -3,5 +3,5 @@ __pycache__/
 *.bak
 *.dist
 *.png
+!preview.png
 .DS_Store
-
