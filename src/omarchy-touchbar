@@ -34,6 +34,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -55,8 +56,10 @@ GOAL_ACKS = os.path.join(HOME, ".local", "state", "omarchy-pl", "touchbar-goals.
 VOXTYPE_STATE = os.path.join(RUNTIME, "voxtype", "state")
 VOXTYPE_AUDIO = os.path.join(RUNTIME, "voxtype", "audio.sock")
 AUDIO_LEVEL_FRAME = struct.Struct("=Ifff")
-HYPR_SIG = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
-HYPR_DIR = os.path.join(RUNTIME, "hypr", HYPR_SIG)
+HYPR_ROOT = os.path.join(RUNTIME, "hypr")
+_HYPR_DIR_CACHE = None
+_HYPR_ERROR = None
+_HYPR_STATE_LOCK = threading.Lock()
 
 PAGES = ("auto", "apps", "system", "settings", "fn")
 
@@ -1192,24 +1195,126 @@ def transcript_for(cwd):
 
 
 # ------------------------------------------------------------- hyprland ipc --
-def hypr(command, as_json=True):
-    path = os.path.join(HYPR_DIR, ".socket.sock")
+def _hypr_socket_candidates(name):
+    """Return live, user-owned Hyprland sockets in preference order.
+
+    A persistent systemd user unit can start before Hyprland exports
+    HYPRLAND_INSTANCE_SIGNATURE, and the user manager does not necessarily
+    inherit that variable later.  Discovering sockets beneath the private
+    XDG runtime directory keeps the daemon attached across that startup race
+    and across compositor restarts.
+    """
+    directories = []
+
+    def add(directory):
+        if directory and directory not in directories:
+            directories.append(directory)
+
+    with _HYPR_STATE_LOCK:
+        add(_HYPR_DIR_CACHE)
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "").strip()
+    if signature and os.path.basename(signature) == signature:
+        add(os.path.join(HYPR_ROOT, signature))
+
+    discovered = []
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(2.0)
-        sock.connect(path)
+        for entry in os.scandir(HYPR_ROOT):
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if entry.is_dir(follow_symlinks=False) and info.st_uid == os.getuid():
+                socket_path = os.path.join(entry.path, name)
+                try:
+                    socket_info = os.stat(socket_path, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISSOCK(socket_info.st_mode) and socket_info.st_uid == os.getuid():
+                    discovered.append((socket_info.st_mtime_ns, entry.path))
+    except OSError:
+        pass
+    for _, directory in sorted(discovered, reverse=True):
+        add(directory)
+
+    paths = []
+    for directory in directories:
+        path = os.path.join(directory, name)
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():
+            paths.append(path)
+    return paths
+
+
+def _hypr_problem(message):
+    global _HYPR_ERROR
+    with _HYPR_STATE_LOCK:
+        if message == _HYPR_ERROR:
+            return
+        _HYPR_ERROR = message
+    sys.stderr.write("omarchy-touchbar: Hyprland IPC unavailable: %s\n" % message)
+    sys.stderr.flush()
+
+
+def _hypr_connected(path):
+    global _HYPR_DIR_CACHE, _HYPR_ERROR
+    recovered = False
+    with _HYPR_STATE_LOCK:
+        _HYPR_DIR_CACHE = os.path.dirname(path)
+        recovered = _HYPR_ERROR is not None
+        _HYPR_ERROR = None
+    if recovered:
+        sys.stderr.write("omarchy-touchbar: Hyprland IPC connected\n")
+        sys.stderr.flush()
+
+
+def _open_hypr_socket(name):
+    paths = _hypr_socket_candidates(name)
+    if not paths:
+        _hypr_problem("no %s socket found beneath %s" % (name, HYPR_ROOT))
+        return None
+    last_error = None
+    for path in paths:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            sock.connect(path)
+            _hypr_connected(path)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    _hypr_problem(str(last_error or "connection failed"))
+    return None
+
+
+def hypr(command, as_json=True):
+    sock = _open_hypr_socket(".socket.sock")
+    if sock is None:
+        return None
+    try:
         sock.sendall((("j/" if as_json else "/") + command).encode())
         chunks = []
+        size = 0
         while True:
             chunk = sock.recv(65536)
             if not chunk:
                 break
+            size += len(chunk)
+            if size > 8 * 1024 * 1024:
+                raise ValueError("Hyprland response exceeds 8 MiB")
             chunks.append(chunk)
-        sock.close()
         raw = b"".join(chunks)
         return json.loads(raw) if as_json else raw.decode()
-    except Exception:                                       # noqa: BLE001
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        _hypr_problem(str(exc))
         return None
+    finally:
+        sock.close()
 
 
 # ----------------------------------------------------------- button drawing --
@@ -3029,7 +3134,6 @@ INTERESTING = (
 
 
 def watch_hyprland(bar):
-    path = os.path.join(HYPR_DIR, ".socket2.sock")
     pending = threading.Event()
     kinds = set()
     kinds_lock = threading.Lock()
@@ -3066,13 +3170,21 @@ def watch_hyprland(bar):
     threading.Thread(target=painter, daemon=True).start()
 
     while True:
+        sock = _open_hypr_socket(".socket2.sock")
+        if sock is None:
+            time.sleep(1)
+            continue
+        # The two-second timeout protects command requests, but the event
+        # socket is intentionally idle between compositor changes.  Once the
+        # connection succeeds it must remain blocking, otherwise quiet periods
+        # create reconnect gaps that can lose the next focus event.
+        sock.settimeout(None)
         try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(path)
             buffer = ""
             while True:
                 chunk = sock.recv(8192)
                 if not chunk:
+                    _hypr_problem("event socket closed")
                     break
                 buffer += chunk.decode(errors="replace")
                 while "\n" in buffer:
@@ -3082,8 +3194,10 @@ def watch_hyprland(bar):
                         with kinds_lock:
                             kinds.add(kind)
                         pending.set()
-        except Exception:                                   # noqa: BLE001
-            pass
+        except (OSError, UnicodeError) as exc:
+            _hypr_problem(str(exc))
+        finally:
+            sock.close()
         time.sleep(1)                 # Hyprland restarted; reconnect
 
 
