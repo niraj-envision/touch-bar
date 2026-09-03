@@ -389,6 +389,35 @@ class BrowserTabs:
         index = max(0, min(len(entries) - 1, int(tab.get("index", 1)) - 1))
         return entries[index] or {}
 
+    @classmethod
+    def visible_tabs(cls, window):
+        """The tabs the browser actually shows, in strip order, and which of
+        them is selected. Must match the browser's own Alt/Ctrl+N numbering:
+        hidden tabs, tabs from other Zen workspaces and Zen's invisible
+        empty-tab placeholder (`zenIsEmpty`) are all skipped, because the
+        browser skips them too and a stale one shifts every number by one."""
+        all_tabs = window.get("tabs") or []
+        selected_tab = max(0, min(len(all_tabs) - 1,
+                                  int(window.get("selected", 1)) - 1))
+        active_space = window.get("activeZenSpace")
+        kept = []
+        selected = 0
+        for original, tab in enumerate(all_tabs):
+            if tab.get("hidden") or tab.get("zenIsEmpty") or tab.get("zenIsGlance"):
+                continue
+            workspace = tab.get("zenWorkspace")
+            if active_space and workspace and workspace != active_space:
+                continue
+            entry = cls.current_entry(tab)
+            url = str(entry.get("url") or "")
+            title = browser_title(entry.get("title")) or urllib.parse.urlsplit(url).hostname \
+                or "New tab"
+            if original == selected_tab:
+                selected = len(kept)
+            kept.append({"title": title, "url": url,
+                         "image": tab.get("image") or tab.get("zenPinnedIcon")})
+        return kept, selected
+
     def choose_window(self, session, active_win):
         windows = session.get("windows") or []
         if not windows:
@@ -451,26 +480,7 @@ class BrowserTabs:
         window = self.choose_window(session, active_win)
         if not window:
             return False
-        all_tabs = window.get("tabs") or []
-        selected_tab = max(0, min(len(all_tabs) - 1,
-                                  int(window.get("selected", 1)) - 1))
-        active_space = window.get("activeZenSpace")
-        kept = []
-        selected = 0
-        for original, tab in enumerate(all_tabs):
-            if tab.get("hidden"):
-                continue
-            workspace = tab.get("zenWorkspace")
-            if active_space and workspace and workspace != active_space:
-                continue
-            entry = self.current_entry(tab)
-            url = str(entry.get("url") or "")
-            title = browser_title(entry.get("title")) or urllib.parse.urlsplit(url).hostname \
-                or "New tab"
-            if original == selected_tab:
-                selected = len(kept)
-            kept.append({"title": title, "url": url,
-                         "image": tab.get("image") or tab.get("zenPinnedIcon")})
+        kept, selected = self.visible_tabs(window)
         self.file_selected = selected
         if self.override:
             target, at_tap, deadline = self.override

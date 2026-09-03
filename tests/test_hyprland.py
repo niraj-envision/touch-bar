@@ -16,6 +16,27 @@ tb = importlib.util.module_from_spec(spec)
 loader.exec_module(tb)
 
 
+class BrowserTabNumbering(unittest.TestCase):
+    def test_zen_placeholders_do_not_shift_tab_numbers(self):
+        def tab(title, **flags):
+            return dict({"entries": [{"title": title, "url": "https://x/" + title}],
+                         "index": 1, "zenWorkspace": "ws1"}, **flags)
+
+        window = {"selected": 4, "activeZenSpace": "ws1", "tabs": [
+            tab("empty", zenIsEmpty=True),
+            tab("one"), tab("two"),
+            tab("elsewhere", zenWorkspace="ws2"),
+            tab("three"), tab("ghost", hidden=True), tab("four"),
+        ]}
+        tabs, selected = tb.BrowserTabs.visible_tabs(window)
+        self.assertEqual([t["title"] for t in tabs], ["one", "two", "three", "four"])
+        # `selected` is 1-based over the raw list: 4 -> "elsewhere" is not
+        # visible, so the nearest kept index before it stays selected.
+        window["selected"] = 5
+        tabs, selected = tb.BrowserTabs.visible_tabs(window)
+        self.assertEqual(tabs[selected]["title"], "three")
+
+
 class HyprlandDiscovery(unittest.TestCase):
     def setUp(self):
         self.old_root = tb.HYPR_ROOT
