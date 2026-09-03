@@ -11,16 +11,21 @@
 # accent, on_accent, fg, muted - or any colour name from the theme's
 # colors.toml (red, green, yellow, blue, magenta, cyan, orange), or a #hex.
 #
-#   omarchy-touchbar page next     smart bar <-> F1-F12
+#   omarchy-touchbar page next     smart bar -> apps -> vitals -> controls -> F-keys
 #   omarchy-touchbar preview       render a PNG mock-up of the bar
-# Hold fn at any time for the media keys (brightness, volume, playback).
+#   omarchy-touchbar preview system|settings|apps|fn|recording|review|goal
+# Tap fn to open the controls page: brightness, keyboard light and volume
+# sliders (tap or drag the track; tap the glyph to switch off/mute) and
+# playback. Battery, CPU, RAM, swap, temperature, fans, disk and uptime live
+# on the vitals page.
 
 [settings]
-font = "JetBrainsMono Nerd Font"
+font = "JetBrainsMono Nerd Font"    # glyphs, and tiny-dfr's own esc key
+text_font = "Adwaita Sans"          # labels and numbers; glyphs fall back to `font`
 slots = 13                  # buttons besides the esc key tiny-dfr adds itself
 corner_radius = 13
 animate = true              # buttons pop when their contents change
-claude_spinner = 0.32       # seconds per spinner frame while Claude works
+claude_spinner = 0.45       # seconds per spinner frame while Claude works
 claude_context_limit = 0    # 0 = infer 200k vs 1M from the transcript
 # Anthropic does not publish your weekly allowance anywhere on disk, so the
 # week tile shows the last 7 days of tokens. Set a token budget here and it
@@ -33,8 +38,8 @@ windows = 4                 # "jump to window" buttons, most-recent first
 
 adaptive_brightness = true
 active_brightness = 128
-clock = ""                  # e.g. "%H:%M" to show a clock
-battery = ""                # "percentage", "icon" or "both"
+clock = ""                  # e.g. "%H:%M": a themed clock with the date beneath
+battery = ""                # "percentage" or "icon": a themed battery ring
 
 # Glyphs for the window buttons: [glyph, colour], matched on window class in order.
 [icons]

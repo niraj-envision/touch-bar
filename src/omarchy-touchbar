@@ -158,6 +158,8 @@ def parse_chord(spec):
 DEFAULTS = {
     "settings": {
         "font": "JetBrainsMono Nerd Font",
+        # Labels and numbers are set in this face; glyphs fall back to `font`.
+        "text_font": "Adwaita Sans",
         "adaptive_brightness": True,
         "active_brightness": 128,
         "pixel_shift": False,
@@ -513,7 +515,7 @@ class BrowserTabs:
             if mime:
                 result = "data:%s;base64,%s" % (
                     mime, base64.b64encode(bytes(data)).decode("ascii"))
-        if len(self.icon_cache) >= 256:      # icons are up to 300 KB each
+        if len(self.icon_cache) >= 48:       # icons are up to 300 KB each
             self.icon_cache.pop(next(iter(self.icon_cache)))
         self.icon_cache[url] = result
         return result
@@ -702,12 +704,24 @@ class MediaState:
         if chosen:                    # mute only matters while transport shows
             volume = run_quiet(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
             self.muted = "MUTED" in volume
+            self.title = self._title(chosen)
+        else:
+            self.title = ""
 
     def _property(self, name, prop):
         out = run_quiet(["busctl", "--user", "get-property", name, MPRIS_PATH,
                          MPRIS_PLAYER, prop])
         parts = out.strip().split('"')
         return parts[1] if len(parts) > 1 else ""
+
+    def _title(self, name):
+        """'Title — Artist' from the MPRIS metadata dictionary."""
+        out = run_quiet(["busctl", "--user", "get-property", name, MPRIS_PATH,
+                         MPRIS_PLAYER, "Metadata"])
+        title = re.search(r'"xesam:title" s "((?:[^"\\]|\\.)*)"', out)
+        artist = re.search(r'"xesam:artist" as \d+ "((?:[^"\\]|\\.)*)"', out)
+        parts = [m.group(1).replace('\\"', '"') for m in (title, artist) if m]
+        return " — ".join(p for p in parts if p)
 
     @property
     def active(self):
@@ -774,6 +788,8 @@ class SystemStats:
         self.temp = None                          # CPU package, °C
         self.fans = []                            # (rpm, max rpm or None)
         self.battery = None                       # (percent, status)
+        self.disk = None                          # (used frac, used kB, total kB) for /
+        self.uptime = 0.0                         # seconds
         self.brightness = None                    # screen backlight, 0-100
         self.kbd = None                           # keyboard backlight, 0-100
         self.volume = None                        # (percent, muted)
@@ -856,6 +872,19 @@ class SystemStats:
             except OSError:
                 status = ""
             self.battery = (percent, status) if percent is not None else None
+        try:
+            fs = os.statvfs("/")
+            total = fs.f_blocks * fs.f_frsize // 1024
+            free = fs.f_bavail * fs.f_frsize // 1024
+            used = total - free
+            self.disk = (used / float(total) if total else 0.0, used, total)
+        except OSError:
+            self.disk = None
+        try:
+            with open("/proc/uptime") as handle:
+                self.uptime = float(handle.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            pass
         return True
 
     @staticmethod
@@ -1002,16 +1031,17 @@ class ClaudeTotals:
                 start = 0
             if size == start:
                 continue
+            # Stream line by line: the first pass covers every transcript on
+            # the machine, and slurping them whole spiked memory by tens of MB.
             try:
                 with open(path, "r", errors="replace") as handle:
                     handle.seek(start)
-                    chunk = handle.read()
+                    for line in handle:
+                        if '"usage"' in line:
+                            self._absorb(line)
                     self.offsets[path] = handle.tell()
             except OSError:
                 continue
-            for line in chunk.splitlines():
-                if '"usage"' in line:
-                    self._absorb(line)
         cutoff = time.time() - self.WINDOW
         self.recent = [(t, n) for t, n in self.recent if t >= cutoff]
 
@@ -1125,7 +1155,24 @@ class ClaudeSession:
                 self._absorb(line)
         return True
 
+    USER_HEAD = re.compile(r'"type"\s*:\s*"user"')
+    STAMP = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+
     def _absorb(self, line):
+        # User records carry tool results that can run to hundreds of
+        # kilobytes, and all we need from them is three flags. Read those
+        # off the raw text instead of decoding the whole record.
+        if self.USER_HEAD.search(line[:400]):
+            if '"isSidechain":true' in line[:600] or '"isSidechain": true' in line[:600]:
+                return
+            stamp = self.STAMP.search(line)
+            if stamp:
+                self.first_ts = self.first_ts or stamp.group(1)
+                self.last_ts = stamp.group(1)
+            if '"tool_result"' not in line:
+                self.turns += 1
+            self.state, self.tool = self.THINKING, ""
+            return
         try:
             record = json.loads(line)
         except ValueError:
@@ -1364,6 +1411,39 @@ def build_goal_svg(spec, width, font):
     </svg>''' % (int(width), left, width, bg, accent, bg, accent, fg, fg, ball_x, ball_y, ball_x, ball_y, 12 + 38 * pulse, red, .75 * pulse, font, red, clock, fg, score, accent, scorer, team)
 
 
+def mix(hex_color, other, amount):
+    """Blend two #rrggbb colours; amount 0 keeps the first, 1 gives the second."""
+    try:
+        a = [int(hex_color[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(other[i:i + 2], 16) for i in (1, 3, 5)]
+    except (ValueError, TypeError, IndexError):
+        return hex_color
+    amount = max(0.0, min(1.0, float(amount)))
+    return "#%02x%02x%02x" % tuple(
+        int(round(x + (y - x) * amount)) for x, y in zip(a, b))
+
+
+def arc_path(cx, cy, r, start_deg, sweep_deg):
+    """An SVG arc, clockwise from `start_deg` (0 = twelve o'clock)."""
+    sweep_deg = max(0.0, min(359.9, float(sweep_deg)))
+    a0 = math.radians(start_deg - 90)
+    a1 = math.radians(start_deg + sweep_deg - 90)
+    x0, y0 = cx + r * math.cos(a0), cy + r * math.sin(a0)
+    x1, y1 = cx + r * math.cos(a1), cy + r * math.sin(a1)
+    large = 1 if sweep_deg > 180 else 0
+    return "M%.2f %.2f A%.2f %.2f 0 %d 1 %.2f %.2f" % (x0, y0, r, r, large, x1, y1)
+
+
+# Slider geometry is shared by the renderer and the touch handler, so a tap
+# lands exactly where the knob is drawn.
+SLIDER_ICON_W = 52
+SLIDER_PAD_R = 22
+
+
+def slider_track(width):
+    return SLIDER_ICON_W, max(SLIDER_ICON_W + 20.0, width - SLIDER_PAD_R)
+
+
 def build_svg(spec, width, radius, font, scale=1.0):
     """One button, drawn edge to edge so we own every pixel of it."""
     if spec.get("goal_scene"):
@@ -1372,6 +1452,16 @@ def build_svg(spec, width, radius, font, scale=1.0):
     size = spec.get("size", 26)
     caption = html.escape(str(spec.get("sub") or ""))
     gauge = spec.get("gauge")
+    ring = spec.get("ring")
+    slider = spec.get("slider")
+    spin = spec.get("spin")
+    fill = spec.get("fill", "#3c3836")
+    fg = spec.get("fg", "#d4be98")
+    text_font = spec.get("text_font") or font
+    # Text is set in the UI face with the icon font as fallback, so a label
+    # that is a Nerd Font glyph still resolves.
+    family = html.escape("%s, %s" % (text_font, font)) if text_font != font \
+        else html.escape(font)
     # Use essentially all 60 physical pixels. The old 48px pills looked like a
     # narrow toolbar floating inside the Touch Bar instead of owning it.
     pill_w, pill_h = width - 4, 58
@@ -1381,12 +1471,21 @@ def build_svg(spec, width, radius, font, scale=1.0):
         if scale != 1.0
         else ""
     )
+    defs = [
+        '<linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="#ffffff" stop-opacity="0.13"/>'
+        '<stop offset="0.55" stop-color="#ffffff" stop-opacity="0.02"/>'
+        '<stop offset="1" stop-color="#ffffff" stop-opacity="0"/></linearGradient>',
+        # A faint vertical ramp gives every pill a little depth instead of
+        # reading as a flat rectangle of colour.
+        '<linearGradient id="f" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="%s"/><stop offset="1" stop-color="%s"/>'
+        '</linearGradient>' % (mix(fill, "#ffffff", 0.05), mix(fill, "#000000", 0.10)),
+    ]
     gloss = ""
     if spec.get("gloss", True):
-        gloss = (
-            '<rect x="2" y="1" width="%.2f" height="%.2f" rx="%d" fill="url(#g)"/>'
-            % (pill_w, pill_h / 2, radius)
-        )
+        gloss = ('<rect x="2" y="1" width="%.2f" height="%.2f" rx="%d" fill="url(#g)"/>'
+                 % (pill_w, pill_h * 0.62, radius))
     badge = ""
     if spec.get("badge"):
         badge = (
@@ -1394,27 +1493,26 @@ def build_svg(spec, width, radius, font, scale=1.0):
             '<text x="%.2f" y="16.5" font-family="%s" font-size="11" '
             'font-weight="bold" fill="%s" text-anchor="middle">%s</text>'
             % (width - 15, spec.get("badge_fill", "#161616"), width - 15,
-               font, spec.get("badge_fg", "#d4be98"),
+               family, spec.get("badge_fg", "#d4be98"),
                html.escape(str(spec["badge"])))
         )
-    glow = ""
     shadow = ""
     if spec.get("glow"):
-        glow = (
+        defs.append(
             '<filter id="halo" x="-30%" y="-60%" width="160%" height="220%">'
             '<feGaussianBlur stdDeviation="3" result="blur"/>'
             '<feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/>'
-            '</feMerge></filter>'
-        )
+            '</feMerge></filter>')
         shadow = ' filter="url(#halo)"'
-    fg = spec.get("fg", "#d4be98")
 
-    def text(y, body, px, colour):
+    def text(y, body, px, colour, x=None, anchor="middle", weight="bold",
+             extra=""):
         if not body:
             return ""
         return ('<text x="%.2f" y="%.2f" font-family="%s" font-size="%d" '
-                'font-weight="bold" fill="%s" text-anchor="middle">%s</text>'
-                % (width / 2, y, font, px, colour, body))
+                'font-weight="%s" fill="%s" text-anchor="%s"%s>%s</text>'
+                % (width / 2 if x is None else x, y, family, px, weight, colour,
+                   anchor, extra, body))
 
     favicon = spec.get("favicon")
     tab_title = str(spec.get("tab_title") or "")
@@ -1444,7 +1542,7 @@ def build_svg(spec, width, radius, font, scale=1.0):
                 '<text x="%.2f" y="37" font-family="%s" font-size="18" '
                 'font-weight="bold" fill="%s" text-anchor="start" '
                 'clip-path="url(#tabtext)">%s</text>'
-                % (text_left, max(1.0, text_right - text_left), text_left, font,
+                % (text_left, max(1.0, text_right - text_left), text_left, family,
                    fg, html.escape(shown))
             )
         if spec.get("tab_active"):
@@ -1463,7 +1561,7 @@ def build_svg(spec, width, radius, font, scale=1.0):
         # Voxtype provides the real minimum and maximum sample values for
         # every frame. Render their envelope so the waveform rises and falls
         # above and below the centre line instead of becoming flat dots.
-        pad, centre, half_height = 22.0, BAR_HEIGHT / 2.0, 23.0
+        pad, centre_y, half_height = 22.0, BAR_HEIGHT / 2.0, 23.0
         count = len(waveform)
         step = (width - pad * 2) / max(1, count - 1)
         upper, lower = [], []
@@ -1471,40 +1569,118 @@ def build_svg(spec, width, radius, font, scale=1.0):
             x = pad + index * step
             low = max(-1.0, min(0.0, float(minimum)))
             high = min(1.0, max(0.0, float(maximum)))
-            upper.append((x, centre - high * half_height))
-            lower.append((x, centre - low * half_height))
+            upper.append((x, centre_y - high * half_height))
+            lower.append((x, centre_y - low * half_height))
         upper_points = " ".join("%.2f,%.2f" % point for point in upper)
         lower_points = " ".join("%.2f,%.2f" % point for point in lower)
         envelope = upper_points + " " + " ".join(
             "%.2f,%.2f" % point for point in reversed(lower))
-        wave_color = spec.get("fg", "#d4be98")
+        defs.append(
+            '<linearGradient id="w" x1="0" y1="0" x2="1" y2="0">'
+            '<stop offset="0" stop-color="%s" stop-opacity="0.05"/>'
+            '<stop offset="0.5" stop-color="%s" stop-opacity="0.35"/>'
+            '<stop offset="1" stop-color="%s" stop-opacity="0.05"/></linearGradient>'
+            % (fg, fg, fg))
         body = (
             '<line x1="%.2f" y1="%.2f" x2="%.2f" y2="%.2f" '
             'stroke="%s" stroke-width="1" opacity="0.22"/>'
-            '<polygon points="%s" fill="%s" opacity="0.24"/>'
+            '<polygon points="%s" fill="url(#w)"/>'
             '<polyline points="%s" fill="none" stroke="%s" '
             'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>'
             '<polyline points="%s" fill="none" stroke="%s" '
             'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>'
-            % (pad, centre, width - pad, centre, wave_color, envelope,
-               wave_color, upper_points, wave_color, lower_points, wave_color)
+            % (pad, centre_y, width - pad, centre_y, fg, envelope,
+               upper_points, fg, lower_points, fg)
         )
     elif bars:
         count = len(bars)
         bar_w, gap = 7.0, 5.0
         span = count * bar_w + (count - 1) * gap
         left = (width - span) / 2.0
-        tallest = 34.0
+        tallest = 26.0 if caption else 34.0
+        middle = 24.0 if caption else BAR_HEIGHT / 2
         body = ""
         for index, height in enumerate(bars):
             tall = max(5.0, tallest * float(height))
             body += ('<rect x="%.2f" y="%.2f" width="%.2f" height="%.2f" rx="3" '
                      'fill="%s"/>'
-                     % (left + index * (bar_w + gap),
-                        BAR_HEIGHT / 2 - tall / 2, bar_w, tall,
-                        spec.get("fg", "#d4be98")))
+                     % (left + index * (bar_w + gap), middle - tall / 2, bar_w,
+                        tall, fg))
+        if caption:
+            body += text(52, caption, spec.get("sub_size", 11), spec.get("sub_fg", fg))
+    elif slider is not None:
+        # A Mac-style level control: glyph, a track that fills to the level,
+        # and a knob. The daemon resolves taps and drags along the track.
+        level = max(0.0, min(1.0, float(slider)))
+        x0, x1 = slider_track(width)
+        track_y, track_h = 30.0, 8.0
+        knob_x = x0 + (x1 - x0) * level
+        bar_color = spec.get("bar", fg)
+        defs.append(
+            '<linearGradient id="s" x1="0" y1="0" x2="1" y2="0">'
+            '<stop offset="0" stop-color="%s"/><stop offset="1" stop-color="%s"/>'
+            '</linearGradient>' % (mix(bar_color, "#000000", 0.25), bar_color))
+        body = (
+            text(BAR_HEIGHT / 2 + size * 0.36 - (5 if caption else 0), label, size,
+                 fg, x=SLIDER_ICON_W / 2)
+            + (text(52, caption, spec.get("sub_size", 10), spec.get("sub_fg", fg),
+                    x=SLIDER_ICON_W / 2) if caption else "")
+            + '<rect x="%.2f" y="%.2f" width="%.2f" height="%.2f" rx="%.2f" fill="%s"/>'
+              % (x0, track_y - track_h / 2, x1 - x0, track_h, track_h / 2,
+                 spec.get("track", "#161616"))
+            + '<rect x="%.2f" y="%.2f" width="%.2f" height="%.2f" rx="%.2f" fill="url(#s)"/>'
+              % (x0, track_y - track_h / 2, max(track_h, knob_x - x0), track_h,
+                 track_h / 2)
+            + '<circle cx="%.2f" cy="%.2f" r="12" fill="%s" opacity="0.35"/>'
+              % (knob_x, track_y, bar_color)
+            + '<circle cx="%.2f" cy="%.2f" r="9" fill="%s"/>'
+              % (knob_x, track_y, "#f4f1ea" if not spec.get("slider_off") else "#8a8a8a")
+        )
+        if spec.get("slider_label"):
+            body += text(track_y + 4, html.escape(str(spec["slider_label"])), 11,
+                         spec.get("track", "#161616"), x=knob_x)
+    elif ring is not None and width >= 96:
+        # Complication layout: a ring gauge on the left, value and caption on
+        # the right. Reads at a glance and never needs a full-width track.
+        share = max(0.0, min(1.0, float(ring)))
+        cx, cy, r = 29.0, 30.0, 17.5
+        bar_color = spec.get("bar", fg)
+        ring_svg = (
+            '<circle cx="%.2f" cy="%.2f" r="%.2f" fill="none" stroke="%s" '
+            'stroke-width="5" opacity="0.28"/>' % (cx, cy, r, spec.get("track", "#161616"))
+        )
+        if share >= 0.999:
+            ring_svg += ('<circle cx="%.2f" cy="%.2f" r="%.2f" fill="none" stroke="%s" '
+                         'stroke-width="5"/>' % (cx, cy, r, bar_color))
+        elif share > 0.005:
+            ring_svg += ('<path d="%s" fill="none" stroke="%s" stroke-width="5" '
+                         'stroke-linecap="round"/>'
+                         % (arc_path(cx, cy, r, 0, share * 360), bar_color))
+        glyph = spec.get("ring_glyph")
+        if glyph:
+            ring_svg += text(cy + 5, html.escape(str(glyph)), 13, spec.get("ring_glyph_fg", fg),
+                             x=cx)
+        column_x = (cx + r + 8 + width - 8) / 2
+        body = ring_svg + text(29 if caption else BAR_HEIGHT / 2 + size * 0.36,
+                               label, size, fg, x=column_x)
+        if caption:
+            body += text(47, caption, spec.get("sub_size", 12),
+                         spec.get("sub_fg", fg), x=column_x)
+    elif spin is not None:
+        # An arc that chases its own tail: the busy indicator. Legible as a
+        # still frame and unmistakably alive once it turns.
+        cx, cy, r = width / 2, 22.0 if caption else BAR_HEIGHT / 2, 12.0
+        start = (int(spin) * 45) % 360
+        body = (
+            '<circle cx="%.2f" cy="%.2f" r="%.2f" fill="none" stroke="%s" '
+            'stroke-width="4" opacity="0.25"/>' % (cx, cy, r, fg)
+            + '<path d="%s" fill="none" stroke="%s" stroke-width="4" '
+              'stroke-linecap="round"/>' % (arc_path(cx, cy, r, start, 250), fg)
+        )
+        if caption:
+            body += text(51, caption, spec.get("sub_size", 12), spec.get("sub_fg", fg))
     elif gauge is not None:
-        pad, track_y, track_h = 16.0, 42.0, 8.0
+        pad, track_y, track_h = 16.0, 43.0, 7.0
         track_w = width - pad * 2
         filled = max(track_h, track_w * min(max(float(gauge), 0.0), 1.0))
         body = (
@@ -1521,28 +1697,45 @@ def build_svg(spec, width, radius, font, scale=1.0):
     else:
         body = text(BAR_HEIGHT / 2 + size * 0.36, label, size, fg)
 
+    if spec.get("dots"):
+        # A row of position dots along the bottom edge (page/workspace index).
+        total, current = spec["dots"]
+        total = max(1, int(total))
+        gap = 9.0
+        left = width / 2 - (total - 1) * gap / 2
+        dot_fg = spec.get("sub_fg", fg)
+        for index in range(total):
+            body += ('<circle cx="%.2f" cy="53.5" r="%.1f" fill="%s" opacity="%.2f"/>'
+                     % (left + index * gap, 2.4 if index == current else 1.8,
+                        dot_fg, 1.0 if index == current else 0.38))
+
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
-        'viewBox="0 0 %d %d">'
-        '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
-        '<stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>'
-        '<stop offset="1" stop-color="#ffffff" stop-opacity="0"/>'
-        "</linearGradient>%s</defs>"
-        '<g%s%s><rect x="2" y="1" width="%.2f" height="%.2f" rx="%d" fill="%s"/>%s'
+        'viewBox="0 0 %d %d"><defs>%s</defs>'
+        '<g%s%s><rect x="2" y="1" width="%.2f" height="%.2f" rx="%d" fill="url(#f)"/>'
+        '<rect x="2.5" y="1.5" width="%.2f" height="%.2f" rx="%d" fill="none" '
+        'stroke="#ffffff" stroke-opacity="0.07"/>%s'
         "%s%s</g></svg>"
         % (
-            int(width), BAR_HEIGHT, int(width), BAR_HEIGHT,
-            glow, transform, shadow, pill_w, pill_h, radius,
-            spec.get("fill", "#3c3836"), gloss, body, badge,
+            int(width), BAR_HEIGHT, int(width), BAR_HEIGHT, "".join(defs),
+            transform, shadow, pill_w, pill_h, radius,
+            pill_w - 1, pill_h - 1, max(0, radius - 1), gloss, body, badge,
         )
     )
 
 
 class IconCache:
-    """SVGs are content-addressed, so identical buttons reuse one file."""
+    """SVGs are content-addressed, so identical buttons reuse one file.
 
-    def __init__(self, clear=False):
-        self.known = set()
+    Animated states (a live waveform, spinner frames, a marquee) mint a new
+    file for every frame, so the directory is kept as an LRU: once it holds
+    more than `limit` files the least recently referenced ones are removed.
+    A layout references at most 14 files, so the live one is never touched.
+    """
+
+    def __init__(self, clear=False, limit=600):
+        self.known = {}                       # digest -> None, insertion ordered
+        self.limit = limit
         if clear:
             try:
                 shutil.rmtree(GEN_DIR)
@@ -1555,13 +1748,22 @@ class IconCache:
 
     def store(self, svg):
         digest = hashlib.sha1(svg.encode()).hexdigest()[:16]
-        if digest not in self.known:
+        if digest in self.known:
+            self.known.pop(digest)            # re-insert as most recent
+        else:
             try:
                 with open(os.path.join(GEN_DIR, digest + ".svg"), "w") as handle:
                     handle.write(svg)
-                self.known.add(digest)
             except OSError:
                 return None
+        self.known[digest] = None
+        while len(self.known) > self.limit:
+            stale = next(iter(self.known))
+            del self.known[stale]
+            try:
+                os.unlink(os.path.join(GEN_DIR, stale + ".svg"))
+            except OSError:
+                pass
         return "gen/" + digest
 
 
@@ -1685,6 +1887,12 @@ class TouchBar:
         self.goal_queue = deque()
         self.goal_active = None
         self.goal_animating = False
+        # A finger riding a slider: (kind, track left px, track right px).
+        self.drag = None
+        self.drag_level = None
+        self.level_lock = threading.Lock()
+        self.level_pending = {}       # kind -> latest requested level, 0..1
+        self.level_worker = None
         # Animation frames arrive several times a second; each render used to
         # cost four Hyprland IPC round-trips. Cache the compositor state and
         # let the event watcher invalidate it, so polling threads ride the
@@ -1712,7 +1920,10 @@ class TouchBar:
             self.last_written = None      # colours may have changed everywhere
 
     # -- state ------------------------------------------------------------
-    def snapshot(self, max_age=0.5):
+    # The Hyprland event watcher invalidates these caches the moment focus,
+    # workspaces or windows change, so polling threads can lean on them for
+    # seconds at a time without ever showing stale state.
+    def snapshot(self, max_age=2.0):
         now = time.monotonic()
         if self._snapshot_cache is not None and now - self._snapshot_at < max_age:
             return self._snapshot_cache
@@ -1736,7 +1947,7 @@ class TouchBar:
         if not pid:
             return None
         known_pid, checked, found = self.claude_probe
-        if known_pid == pid and time.monotonic() - checked < 2.0:
+        if known_pid == pid and time.monotonic() - checked < 4.0:
             return found
         found = descendant_named(int(pid), "claude")
         self.claude_probe = (pid, time.monotonic(), found)
@@ -1827,11 +2038,10 @@ class TouchBar:
         if collapsed:
             # Folded into one pill so the app keeps the width; tap opens the
             # picker. The dot row still shows where you are at a glance.
-            dots = "".join("\u25cf" if index == current else "\u25cb"
-                           for index in ids)
+            position = ids.index(current) if current in ids else 0
             return [spec(str(current or 1), None, fill="accent", fg="on_accent",
-                         size=27, sub=dots, sub_fg="on_accent", sub_size=12,
-                         daemon="page:workspaces")]
+                         size=27, sub_fg="on_accent", dots=(len(ids), position),
+                         glow=True, daemon="page:workspaces")]
         rows = []
         for index in ids:
             active = index == current
@@ -1850,13 +2060,16 @@ class TouchBar:
         silent, and displaces the typing shortcuts rather than the read-out."""
         if not self.media.active:
             return []
+        title = self.media.title
+        caption = title if len(title) <= 15 else title[:14] + "\u2026"
         if self.media.playing:
-            lead = spec("", None, fill="accent", fg="on_accent",
+            lead = spec("", None, fill="accent", fg="on_accent", glow=True,
                         bars=EQUALIZER[self.media_phase % len(EQUALIZER)],
+                        sub=caption, sub_fg="on_accent", sub_size=11,
                         daemon="media:playpause")
         else:
             lead = spec("\uf04b", None, fill="sunken", fg="green", size=24,
-                        daemon="media:playpause")
+                        sub=caption, sub_size=11, daemon="media:playpause")
         return [
             spec("\uf048", None, fill="sunken", fg="fg", size=22,
                  daemon="media:previous"),
@@ -1874,17 +2087,21 @@ class TouchBar:
         info = self.limits.get(kind)
         if not info or info.get("percent") is None:
             return spec("\u2013", None, fill="sunken", fg="muted", size=21,
-                        gloss=False, sub=caption)
+                        gloss=False, sub=caption, ring=0.0, bar="muted")
         left = max(0, 100 - int(info["percent"]))
         if info.get("severity") in ("warning", "critical"):
             color = "red"
         else:
             color = "green" if left > 40 else "yellow" if left > 15 else "red"
         when = until(info.get("resets_at"))
+        # A stale cache (Claude Code refreshes it when /usage is opened) keeps
+        # its colour but says so, rather than greying out into invisibility.
+        stale = self.limits.stale()
+        detail = when if when and not stale else "old" if stale else ""
         return spec("%d%%" % left, None, fill="sunken",
-                    fg="muted" if self.limits.stale() else color,
-                    size=27, gloss=False,
-                    sub="%s %s" % (caption, when) if when else caption)
+                    fg="muted" if stale else "fg", size=22, gloss=False,
+                    ring=left / 100.0, bar=color,
+                    sub="%s \u00b7 %s" % (caption, detail) if detail else caption)
 
     def claude_tiles(self, session):
         """Live session read-out: what it is doing, and what it has spent."""
@@ -1893,15 +2110,14 @@ class TouchBar:
             return [spec("\uf0e7", None, fill="sunken", fg="muted",
                          size=26, sub="claude")]
         if session.busy:
-            frame = SPINNER[self.claude_phase % len(SPINNER)]
-            caption = (session.tool or "thinking").lower()[:9]
-            lead = spec(frame, None, fill="accent", fg="on_accent",
-                        size=30, glow=True, sub=caption, sub_fg="on_accent")
+            caption = (session.tool or "thinking").lower()[:11]
+            lead = spec("", None, fill="accent", fg="on_accent", glow=True,
+                        spin=self.claude_phase, sub=caption, sub_fg="on_accent")
         else:
             # Idle: name the model, and make it the shortcut for changing it.
             short = re.sub(r"^claude-", "", session.model or "").replace("-", " ")
             lead = spec(short or "claude", None, fill="sunken", fg="accent",
-                        size=21, gloss=False, sub="model \u25be",
+                        size=20, gloss=False, sub="model \u25be",
                         daemon="page:models")
 
         limit = int(settings.get("claude_context_limit", 0) or 0)
@@ -1912,7 +2128,7 @@ class TouchBar:
         used = min(1.0, session.context / float(limit))
         bar_color = "green" if used < 0.6 else "yellow" if used < 0.85 else "red"
         context = spec("%d%%" % round(used * 100), None, fill="sunken",
-                       fg=bar_color, size=27, gloss=False,
+                       fg="fg", size=22, gloss=False, ring=used, bar=bar_color,
                        sub="ctx %s" % compact(session.context))
 
         # Claude Code caches the real buckets, so the local token budget is now
@@ -1927,10 +2143,10 @@ class TouchBar:
             if budget > 0:
                 used = min(1.0, week / float(budget))
                 third = spec("%d%%" % round((1 - used) * 100), None, fill="sunken",
-                             fg="fg", size=21, gloss=False, sub="left", gauge=1 - used,
+                             fg="fg", size=22, gloss=False, sub="budget left",
+                             ring=1 - used,
                              bar=("green" if used < 0.6 else
-                                  "yellow" if used < 0.85 else "red"),
-                             track="darker_background")
+                                  "yellow" if used < 0.85 else "red"))
             else:
                 third = spec(compact(week), None, fill="sunken", fg="yellow",
                              size=21, gloss=False, sub="week")
@@ -1971,16 +2187,14 @@ class TouchBar:
     def chatgpt_tiles(self):
         """Claude-style live telemetry for the ChatGPT/Codex desktop app."""
         data = self.chatgpt_stats
-        phases = ("󰔟", "󰔚", "󰔛", "󰔜")
-        label = phases[self.chatgpt_phase % len(phases)] \
-            if self.chatgpt_thinking else "󰭹"
         caption = (data.get("tool") or
-                   ("thinking" if self.chatgpt_thinking else "ready"))[:9]
-        lead = spec(label, None,
-                    fill="accent" if self.chatgpt_thinking else "sunken",
-                    fg="on_accent" if self.chatgpt_thinking else "green",
-                    size=29, glow=self.chatgpt_thinking, sub=caption,
-                    sub_fg="on_accent" if self.chatgpt_thinking else "muted")
+                   ("thinking" if self.chatgpt_thinking else "ready"))[:11]
+        if self.chatgpt_thinking:
+            lead = spec("", None, fill="accent", fg="on_accent", glow=True,
+                        spin=self.chatgpt_phase, sub=caption, sub_fg="on_accent")
+        else:
+            lead = spec("󰭹", None, fill="sunken", fg="green", size=29,
+                        sub=caption, sub_fg="muted")
 
         context = int(data.get("context") or 0)
         limit = int(data.get("context_limit") or 0)
@@ -1988,18 +2202,17 @@ class TouchBar:
         context_color = "green" if share < 0.6 else "yellow" if share < 0.85 else "red"
         context_tile = spec(
             "%d%%" % round(share * 100) if limit else "--",
-            None, fill="sunken", fg="fg", size=21, gloss=False,
-            sub=compact(context), gauge=share, bar=context_color,
-            track="darker_background")
+            None, fill="sunken", fg="fg", size=22, gloss=False,
+            sub="ctx %s" % compact(context), ring=share, bar=context_color)
 
         usage = data.get("usage")
         usage_color = "green" if usage is None or usage < 50 \
             else "yellow" if usage < 80 else "red"
         usage_tile = spec(
             "%d%%" % usage if usage is not None else "--",
-            None, fill="sunken", fg=usage_color, size=21, gloss=False,
-            sub="usage", gauge=(min(1.0, usage / 100.0) if usage is not None else 0),
-            bar=usage_color, track="darker_background")
+            None, fill="sunken", fg="fg", size=22, gloss=False,
+            sub="5h used", ring=(min(1.0, usage / 100.0) if usage is not None else 0),
+            bar=usage_color)
 
         tiles = [
             lead,
@@ -2056,9 +2269,9 @@ class TouchBar:
             ]
         if self.voice_state == "transcribing":
             return [
-                spec(SPINNER[self.voice_phase % len(SPINNER)], None,
-                     fill="sunken", fg="yellow", size=31, glow=False,
-                     sub="transcribing", sub_size=13, stretch=11),
+                spec("", None, fill="sunken", fg="yellow", glow=False,
+                     spin=self.voice_phase, sub="transcribing", sub_size=13,
+                     stretch=11),
                 spec("󰆴", None, fill="sunken", fg="red", size=28,
                      sub="cancel", sub_size=11, daemon="voice:delete"),
             ]
@@ -2213,28 +2426,65 @@ class TouchBar:
         return ((window_class[:1] or "?").upper(), "muted")
 
     def mode_group(self):
-        icons = {"auto": "󰀻", "apps": "",
-                 "system": "󰍛", "settings": "", "fn": ""}
+        icons = {"auto": "\U000f003b", "apps": "\uf17c",
+                 "system": "\U000f035b", "settings": "\uf1de", "fn": "\uf11c"}
         colors = {"auto": "accent", "apps": "green", "system": "cyan",
                   "settings": "yellow", "fn": "muted"}
-        rows = [spec(icons.get(self.page, ""), None,
+        position = PAGES.index(self.page) if self.page in PAGES else 0
+        rows = [spec(icons.get(self.page, "\uf11c"), None,
                      fill="sunken", fg=colors.get(self.page, "muted"), size=24,
+                     sub_fg="muted", dots=(len(PAGES), position),
                      daemon="page:next")]
         settings = self.config["settings"]
         if settings.get("clock"):
-            rows.append({"time": settings["clock"]})
+            rows.append(self.clock_tile(settings["clock"]))
         if settings.get("battery"):
-            rows.append({"battery": settings["battery"]})
+            rows.append(self.battery_tile(settings["battery"]))
         return rows
+
+    def clock_tile(self, fmt):
+        """Themed clock; tiny-dfr's own Time button is always plain white."""
+        now = time.localtime()
+        try:
+            label = time.strftime(str(fmt), now)
+        except ValueError:
+            label = time.strftime("%H:%M", now)
+        return spec(label, None, fill="sunken", fg="fg", size=22, gloss=False,
+                    sub=time.strftime("%a %-d %b", now), sub_size=11,
+                    sub_fg="muted", daemon="page:system")
+
+    def battery_tile(self, style):
+        """Themed battery ring; taps open the system page for the rest."""
+        self.stats.refresh(interval=5.0)
+        if not self.stats.battery:
+            return spec("\U000f0091", None, fill="sunken", fg="muted", size=22,
+                        gloss=False, daemon="page:system")
+        percent, status = self.stats.battery
+        charging = status in ("Charging", "Full")
+        color = ("green" if charging else "red" if percent <= 15
+                 else "yellow" if percent <= 30 else "fg")
+        label = "%d%%" % percent if style != "icon" else ""
+        return spec(label, None, fill="sunken", fg="fg", size=20, gloss=False,
+                    ring=percent / 100.0, bar=color,
+                    ring_glyph="\U000f140b" if charging else "",
+                    sub="charging" if status == "Charging" else
+                        "full" if status == "Full" else "battery",
+                    sub_size=11, sub_fg="muted", daemon="page:system")
 
     # -- pages ------------------------------------------------------------
     def compose(self, groups, trailing):
         """Always the same number of buttons, whatever is on the bar."""
-        budget = max(1, int(self.config["settings"]["slots"]) - len(trailing))
+        def units(items):
+            return sum(max(1, int(item.get("stretch", 1) or 1)) for item in items)
+
+        budget = max(1, int(self.config["settings"]["slots"]) - units(trailing))
         rows = []
         for group in groups:
-            rows.extend(group[: max(0, budget - len(rows))])
-        rows.extend(BLANK for _ in range(budget - len(rows)))
+            for item in group:
+                if units(rows) + units([item]) > budget:
+                    break
+                rows.append(item)
+        rows.extend(BLANK for _ in range(budget - units(rows)))
         return rows + trailing
 
     def toggle_fn_dashboard(self):
@@ -2375,8 +2625,8 @@ class TouchBar:
         def tile(value, caption, color, gauge=None):
             extra = {"daemon": "page:chatgpt"}
             if gauge is not None:
-                extra.update(gauge=max(0.0, min(1.0, gauge)), bar=color,
-                             track="darker_background")
+                extra.update(ring=max(0.0, min(1.0, gauge)), bar=color)
+                color = "fg"
             return spec(str(value), None, fill="sunken", fg=color, size=20,
                         gloss=False, sub=caption, **extra)
 
@@ -2450,13 +2700,16 @@ class TouchBar:
         stats = self.stats
         stats.refresh(interval=1.0)
 
-        def tile(value, caption, color, gauge=None):
-            extra = {}
+        def tile(value, caption, color, gauge=None, glyph=""):
+            extra = {"ring_glyph": glyph, "ring_glyph_fg": color}
             if gauge is not None:
-                extra.update(gauge=max(0.0, min(1.0, gauge)), bar=color,
-                             track="darker_background")
-            return spec(str(value), None, fill="sunken", fg=color, size=20,
-                        gloss=False, sub=caption, **extra)
+                extra.update(ring=max(0.0, min(1.0, gauge)), bar=color)
+            return spec(str(value), None, fill="sunken",
+                        fg="fg" if gauge is not None else color, size=20,
+                        gloss=False, sub=caption, sub_fg="muted", **extra)
+
+        def heat(value, warm, hot):
+            return "green" if value < warm else "yellow" if value < hot else "red"
 
         rows = []
         if stats.battery:
@@ -2464,37 +2717,40 @@ class TouchBar:
             plugged = status in ("Charging", "Full", "Not charging")
             color = ("green" if plugged else
                      "red" if percent <= 15 else
-                     "yellow" if percent <= 40 else "fg")
+                     "yellow" if percent <= 40 else "accent")
             rows.append(tile("%d%%" % percent,
-                             ("battery " + status).strip().lower(),
-                             color, percent / 100.0))
+                             "charging" if status == "Charging" else
+                             "full" if status == "Full" else "battery",
+                             color, percent / 100.0,
+                             "󱐋" if status == "Charging" else "󰁹"))
         cpu = int(round(stats.cpu * 100))
-        rows.append(tile("%d%%" % cpu, "cpu",
-                         "green" if cpu < 50 else "yellow" if cpu < 85 else "red",
-                         stats.cpu))
-        rows.append(tile("%.2f" % stats.load, "load", "blue"))
+        rows.append(tile("%d%%" % cpu, "cpu · %.2f" % stats.load,
+                         heat(cpu, 50, 85), stats.cpu, "󰍛"))
         mem = int(round(stats.mem_frac * 100))
-        rows.append(tile("%d%%" % mem,
-                         "ram %s/%s" % (human_kb(stats.mem_used),
-                                        human_kb(stats.mem_total)),
-                         "green" if mem < 60 else "yellow" if mem < 85 else "red",
-                         stats.mem_frac))
+        rows.append(tile(human_kb(stats.mem_used),
+                         "ram of %s" % human_kb(stats.mem_total),
+                         heat(mem, 60, 85), stats.mem_frac, "󰘚"))
         if stats.swap_total:
             swap = int(round(stats.swap_frac * 100))
-            rows.append(tile("%d%%" % swap,
-                             "swap %s/%s" % (human_kb(stats.swap_used),
-                                             human_kb(stats.swap_total)),
-                             "green" if swap < 10 else "yellow" if swap < 30
-                             else "red",
-                             stats.swap_frac))
+            rows.append(tile(human_kb(stats.swap_used),
+                             "swap of %s" % human_kb(stats.swap_total),
+                             heat(swap, 10, 30), stats.swap_frac, "󰾴"))
         if stats.temp is not None:
             rows.append(tile("%d°" % round(stats.temp), "cpu temp",
-                             "green" if stats.temp < 70 else
-                             "yellow" if stats.temp < 85 else "red",
-                             stats.temp / 100.0))
+                             heat(stats.temp, 70, 85), stats.temp / 100.0, ""))
         for index, (rpm, top) in enumerate(stats.fans):
-            rows.append(tile(rpm, "fan %d rpm" % (index + 1), "cyan",
-                             rpm / float(top) if top else None))
+            rows.append(tile(rpm, "fan %d rpm" % (index + 1) if len(stats.fans) > 1
+                             else "fan rpm", "cyan",
+                             rpm / float(top) if top else None, "󰈐"))
+        if stats.disk:
+            frac, used, total = stats.disk
+            rows.append(tile(human_kb(used), "disk of %s" % human_kb(total),
+                             heat(frac * 100, 75, 90), frac, "󰋊"))
+        if stats.uptime:
+            hours = int(stats.uptime // 3600)
+            rows.append(tile("%dd %dh" % (hours // 24, hours % 24) if hours >= 24
+                             else "%dh %02dm" % (hours, int(stats.uptime // 60) % 60),
+                             "uptime", "blue", None, "󰅐"))
         return self.compose([rows], self.mode_group())
 
     def page_settings(self):
@@ -2506,20 +2762,31 @@ class TouchBar:
             return spec(glyph, None, fill="surface", fg=color, size=size,
                         daemon=action)
 
-        muted = bool(stats.volume and stats.volume[1])
+        def slider(kind, glyph, level, color, stretch, off=False, caption=""):
+            # Tap anywhere on the track to jump there; drag to sweep. The
+            # daemon owns both from the raw digitizer (see watch_touches).
+            shown = self.drag_level if (self.drag and self.drag[0] == kind
+                                        and self.drag_level is not None) else level
+            return spec(glyph, None, fill="surface", fg="muted" if off else color,
+                        size=24, slider=(shown if shown is not None else 0.0) / 100.0,
+                        bar=color, track="sunken", slider_off=off or shown is None,
+                        sub=caption, sub_fg="muted", sub_size=10,
+                        stretch=stretch, daemon="slider:%s" % kind)
+
+        volume, muted = stats.volume if stats.volume else (None, False)
         rows = [
-            button("󰃞", "sys:bright-", size=22),
-            button("󰃠", "sys:bright+", size=32),
-            button("󰍹", "sys:bright-toggle", "yellow", 27),
-            button("󰌌", "sys:kbd-", size=21),
-            button("󰌌", "sys:kbd+", size=31),
-            button("󰌐", "sys:kbd-toggle", "cyan", 27),
+            slider("bright", "󰃠", stats.brightness, "yellow", 3,
+                   off=stats.brightness is not None and stats.brightness == 0,
+                   caption="%d%%" % stats.brightness if stats.brightness is not None else ""),
+            slider("kbd", "󰌌", stats.kbd, "cyan", 2,
+                   off=stats.kbd is not None and stats.kbd == 0,
+                   caption="%d%%" % stats.kbd if stats.kbd is not None else ""),
             button("󰒮", "media:previous"),
-            button("󰐊", "media:playpause", "green", 29),
+            button("󰏤" if self.media.playing else "󰐊", "media:playpause", "green", 29),
             button("󰒭", "media:next"),
-            button("󰖁", "sys:mute", "red" if muted else "fg"),
-            button("󰕿", "sys:vol-"),
-            button("󰕾", "sys:vol+", size=30),
+            button("󰖁" if muted else "󰕾", "sys:mute", "red" if muted else "fg"),
+            slider("vol", "󰝟" if muted else "󰕾", volume, "green", 3, off=muted,
+                   caption="%d%%" % volume if volume is not None else ""),
         ]
         return self.compose([rows], self.mode_group())
 
@@ -2626,21 +2893,7 @@ class TouchBar:
                 rows.append('    { Battery = %s, Action = "Battery", Stretch = %d },'
                             % (toml_string(item["battery"]), stretch))
                 continue
-            painted = dict(item)
-            painted["fill"] = self.palette.color(item["fill"], "surface")
-            painted["fg"] = self.palette.color(item["fg"], "fg")
-            painted["badge_fill"] = self.palette.color("sunken")
-            painted["badge_fg"] = self.palette.color("fg")
-            if item.get("goal_red"):
-                painted["goal_red"] = self.palette.color(item["goal_red"], "red")
-            for field, fallback in (("bar", "accent"), ("track", "sunken"),
-                                    ("sub_fg", "muted")):
-                if item.get(field):
-                    painted[field] = self.palette.color(item[field], fallback)
-                elif field != "sub_fg":
-                    painted[field] = self.palette.color(fallback)
-                else:
-                    painted[field] = self.palette.color("muted")
+            painted = self.paint(item)
             scale = (scale_at or {}).get(index, 1.0)
             name = self.icons.store(
                 build_svg(painted, width, radius, settings["font"], scale)
@@ -2652,6 +2905,29 @@ class TouchBar:
                 fields.append("Stretch = %d" % stretch)
             rows.append("    { %s }," % ", ".join(fields))
         return emit(settings, rows)
+
+    def paint(self, item):
+        """Resolve every colour role in a spec against the current theme."""
+        painted = dict(item)
+        painted["fill"] = self.palette.color(item.get("fill"), "surface")
+        painted["fg"] = self.palette.color(item.get("fg"), "fg")
+        painted["badge_fill"] = self.palette.color("sunken")
+        painted["badge_fg"] = self.palette.color("fg")
+        painted["text_font"] = self.config["settings"].get("text_font") or \
+            self.config["settings"]["font"]
+        if item.get("goal_red"):
+            painted["goal_red"] = self.palette.color(item["goal_red"], "red")
+        for field, fallback in (("bar", "accent"), ("track", "sunken"),
+                                ("sub_fg", "muted"), ("ring_glyph_fg", "fg")):
+            if item.get(field):
+                painted[field] = self.palette.color(item[field], fallback)
+            else:
+                painted[field] = self.palette.color(fallback)
+        # Ring tracks sit on sunken tiles, so they need to be a shade lighter
+        # than the tile to show at all.
+        if item.get("ring") is not None and not item.get("track"):
+            painted["track"] = mix(painted["fill"], "#ffffff", 0.16)
+        return painted
 
     @staticmethod
     def hit_regions(specs, actions):
@@ -2811,12 +3087,20 @@ class TouchBar:
                                "browser_selected": self.browser.selected,
                                "browser_offset": self.browser_offset,
                                "fn_down": self.fn_down,
+                               "media": {"player": self.media.player,
+                                         "status": self.media.status,
+                                         "title": self.media.title},
+                               "claude": ({"busy": self.claude.busy,
+                                           "model": self.claude.model,
+                                           "tool": self.claude.tool,
+                                           "context": self.claude.context}
+                                          if self.claude else None),
                                "last_touch": self.last_touch,
                                "goal_active": self.goal_active,
                                "goal_queue": len(self.goal_queue)})
         return "unknown command"
 
-    def active_window(self, max_age=0.3):
+    def active_window(self, max_age=2.0):
         now = time.monotonic()
         if now - self._active_at < max_age:
             return self._active_cache
@@ -2932,6 +3216,11 @@ class TouchBar:
             self.render()
         elif kind == "sys" and value:
             self.system_control(value)
+        elif kind == "slider":
+            # Drags along the track never reach here; a tap on the glyph
+            # toggles the control off and back to its previous level.
+            self.system_control({"bright": "bright-toggle", "kbd": "kbd-toggle",
+                                 "vol": "mute"}.get(value, ""))
         elif kind == "voice":
             self.voice_action(value or "toggle")
         elif kind == "focus" and value:
@@ -2984,6 +3273,85 @@ class TouchBar:
             return
         stats.controls_checked = 0.0        # reflect the new level immediately
         self.render(allow_animation=False)
+
+    # -- sliders ----------------------------------------------------------
+    def begin_drag(self, pixel_x):
+        """A finger landed on a slider: remember its track so moves map to
+        levels. Returns True when the touch is claimed."""
+        for region in self.touch_regions:
+            action = region.get("action") or ""
+            if region["left"] <= pixel_x <= region["right"] \
+                    and action.startswith("slider:"):
+                half = BUTTON_SPACING / 2.0
+                left = region["left"] + half
+                width = region["right"] - half - left
+                x0, x1 = slider_track(width)
+                if not (left + x0 - 14 <= pixel_x <= left + x1 + 14):
+                    return False        # the glyph is a toggle, not a level
+                self.drag = (action.partition(":")[2], left + x0, left + x1)
+                self.drag_level = None
+                self.move_drag(pixel_x)
+                return True
+        return False
+
+    def move_drag(self, pixel_x):
+        if not self.drag:
+            return
+        kind, x0, x1 = self.drag
+        level = int(round(max(0.0, min(1.0, (pixel_x - x0) / (x1 - x0))) * 100))
+        if level == self.drag_level:
+            return
+        self.drag_level = level
+        self.request_level(kind, level)
+
+    def end_drag(self):
+        if not self.drag:
+            return
+        self.drag = None
+        self.drag_level = None
+        self.stats.controls_checked = 0.0
+        self.prev_specs = []
+        self.render(allow_animation=False)
+
+    def request_level(self, kind, level):
+        """Latest level wins; a worker applies it so the touch thread never
+        waits on brightnessctl or wpctl."""
+        with self.level_lock:
+            self.level_pending[kind] = level
+            if self.level_worker is None or not self.level_worker.is_alive():
+                self.level_worker = threading.Thread(target=self._apply_levels,
+                                                     daemon=True)
+                self.level_worker.start()
+
+    def _apply_levels(self):
+        while True:
+            with self.level_lock:
+                if not self.level_pending:
+                    return
+                kind, level = self.level_pending.popitem()
+            self.set_level(kind, level)
+            time.sleep(0.03)
+
+    def set_level(self, kind, level):
+        stats = self.stats
+        level = max(0, min(100, int(level)))
+        if kind == "bright" and stats.backlight_device:
+            args = ["brightnessctl", "-d", stats.backlight_device, "s", "%d%%" % level]
+            stats.brightness = level
+        elif kind == "kbd" and stats.kbd_device:
+            args = ["brightnessctl", "-d", stats.kbd_device, "s", "%d%%" % level]
+            stats.kbd = level
+        elif kind == "vol":
+            args = ["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@",
+                    "%.2f" % (level / 100.0)]
+            stats.volume = (level, bool(stats.volume and stats.volume[1]))
+        else:
+            return
+        try:
+            subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=2, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            sys.stderr.write("omarchy-touchbar: %s level failed: %s\n" % (kind, exc))
 
     def run_slash(self, command):
         """Type a slash command into the focused Claude Code prompt.
@@ -3076,22 +3444,42 @@ class TouchBar:
 
 
 # ------------------------------------------------------------------ preview --
-def preview(bar, out="/tmp/omarchy-touchbar-preview.png"):
-    """Rasterise the current layout the same way librsvg will on the panel."""
+def preview(bar, out="/tmp/omarchy-touchbar-preview.png", what="auto"):
+    """Rasterise a layout the same way librsvg will on the panel.
+
+    `what` is a page name, or one of the dictation states (recording,
+    transcribing, review) or `goal` for the celebration scene.
+    """
     settings = bar.config["settings"]
     radius = int(settings["corner_radius"])
-    specs = bar.specs()
+    if what in ("recording", "transcribing", "review"):
+        bar.voice_state = what
+        if what == "recording":
+            for index in range(bar.voice_levels.maxlen):
+                wave = math.sin(index / 3.0) * (0.3 + 0.6 * abs(math.sin(index / 9.0)))
+                bar.voice_levels.append((-abs(wave) * 0.8, abs(wave)))
+        specs = bar.specs()
+    elif what == "goal":
+        specs = bar.goal_specs({"scorer": "M. Salah", "team": "Liverpool",
+                                "homeAbbr": "LIV", "homeScore": 2, "awayScore": 1,
+                                "awayAbbr": "ARS", "clock": "78'"}, 0.68)
+    else:
+        bar.page = what
+        specs = bar.specs()
     parts = []
     items = [{"label": "esc", "fill": "sunken",
               "fg": "muted", "size": 20}] + specs
     for item, (left, width) in zip(items, layout_metrics(specs)):
-        if item.get("spacer") or item.get("time") or item.get("battery"):
+        if item.get("spacer"):
             continue
-        painted = dict(item)
-        painted["fill"] = bar.palette.color(item["fill"], "surface")
-        painted["fg"] = bar.palette.color(item["fg"], "fg")
+        painted = bar.paint(item)
         body = build_svg(painted, width, radius, settings["font"])
         body = body.replace("<svg ", '<svg x="%.2f" ' % left, 1)
+        # Every tile is its own document on the panel; here they share one,
+        # so keep their gradient and filter ids from colliding.
+        suffix = "_%d" % len(parts)
+        body = re.sub(r'id="(\w+)"', lambda m: 'id="%s%s"' % (m.group(1), suffix), body)
+        body = re.sub(r"url\(#(\w+)\)", lambda m: "url(#%s%s)" % (m.group(1), suffix), body)
         parts.append(body)
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d">'
@@ -3275,15 +3663,29 @@ def watch_touches(bar):
                     _, _, etype, code, value = INPUT_EVENT.unpack(data)
                     if etype == EV_ABS and code in (ABS_X, ABS_MT_POSITION_X):
                         raw_x = value
+                        if bar.drag and bar.touch_down:
+                            bar.move_drag(raw_x / 32767.0 * BAR_WIDTH)
                     if etype == EV_KEY and code == BTN_TOUCH:
                         if value:
                             if not bar.touch_down:
                                 start_x = raw_x
                                 started_at = time.monotonic()
+                                bar.touch_down = True
+                                if raw_x is not None:
+                                    try:
+                                        bar.begin_drag(raw_x / 32767.0 * BAR_WIDTH)
+                                    except Exception as exc:  # noqa: BLE001
+                                        sys.stderr.write(
+                                            "omarchy-touchbar: drag failed: %s\n" % exc)
                             bar.touch_down = True
                         else:
                             bar.touch_down = False
                             bar.touch_released_at = time.monotonic()
+                            if bar.drag:
+                                bar.last_touch = {"raw_x": raw_x, "slider": bar.drag[0],
+                                                  "level": bar.drag_level}
+                                bar.end_drag()
+                                continue
                             if raw_x is not None:
                                 pixel_x = max(0.0, min(BAR_WIDTH - 0.01,
                                     raw_x / 32767.0 * BAR_WIDTH))
@@ -3322,6 +3724,7 @@ def watch_touches(bar):
         except OSError:
             pass
         bar.touch_down = False          # never latch the gate across a reconnect
+        bar.drag = None
         time.sleep(2)
 
 
@@ -3334,12 +3737,16 @@ def watch_media(bar):
         if bar.media.active != was_active:
             was_active = bar.media.active
             bar.render()          # transport appeared or disappeared
-        time.sleep(1.5 if bar.media.active else 3.0)
+        # busctl costs a process spawn per poll, so idle polling is lazy;
+        # transport taps refresh immediately through media.checked = 0.
+        time.sleep(2.0 if bar.media.active else 5.0)
 
 
 def watch_browser(bar):
     """Refresh live tabs and advance long-title marquee frames."""
     while True:
+        # Rides the event-invalidated window cache, so when no browser is up
+        # this loop costs a dictionary lookup and a regex, not an IPC call.
         active = bar.active_window()
         profile = bar.profile_for(active)
         if profile.get("name") == "Browser" and bar.page == "auto":
@@ -3350,7 +3757,9 @@ def watch_browser(bar):
             elif bar.browser_active and bar.browser_has_marquee:
                 bar.browser_marquee += 1
                 bar.render(allow_animation=False)
-        time.sleep(BROWSER_POLL)
+            time.sleep(BROWSER_POLL)
+        else:
+            time.sleep(1.5)
 
 
 def watch_system(bar):
@@ -3700,7 +4109,7 @@ def watch_claude(bar):
             # so pace it: four frames at this interval still reads as a spinner.
             bar.claude_phase += 1
             bar.render()
-            time.sleep(float(settings.get("claude_spinner", 0.32)))
+            time.sleep(float(settings.get("claude_spinner", 0.45)))
             continue
         digest = (session.state, session.context, session.output,
                   session.turns, session.permission)
@@ -3799,7 +4208,9 @@ def main():
         run_daemon()
         return 0
     if args[0] == "preview":
-        print(preview(TouchBar()))
+        what = args[1] if len(args) > 1 else "auto"
+        out = args[2] if len(args) > 2 else "/tmp/omarchy-touchbar-preview.png"
+        print(preview(TouchBar(), out, what))
         return 0
     if args[0] == "render" and not send("render"):
         TouchBar().render()

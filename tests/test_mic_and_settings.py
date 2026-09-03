@@ -16,15 +16,46 @@ class MicAndSettings(unittest.TestCase):
         self.bar = tb.TouchBar()
         self.bar.render = lambda *args, **kwargs: None
 
-    def test_settings_is_icon_only_hardware_controls(self):
+    def test_settings_is_sliders_and_transport(self):
         self.bar.page = "settings"
-        actions = {item.get("daemon") for item in self.bar.specs()}
+        specs = self.bar.specs()
+        actions = {item.get("daemon") for item in specs}
         self.assertTrue({
-            "sys:bright-", "sys:bright+", "sys:bright-toggle",
-            "sys:kbd-", "sys:kbd+", "sys:kbd-toggle",
-            "media:previous", "media:playpause", "media:next",
-            "sys:mute", "sys:vol-", "sys:vol+",
+            "slider:bright", "slider:kbd", "slider:vol",
+            "media:previous", "media:playpause", "media:next", "sys:mute",
+            "page:next",
         } <= actions)
+        # Sliders are wide; the page still fills exactly the stable 13 cells.
+        units = sum(max(1, int(item.get("stretch", 1) or 1)) for item in specs)
+        self.assertEqual(units, 13)
+        self.assertFalse(any(item.get("spacer") for item in specs))
+
+    def test_slider_drag_maps_track_position_to_level(self):
+        self.bar.page = "settings"
+        applied = []
+        self.bar.set_level = lambda kind, level: applied.append((kind, level))
+        specs = self.bar.specs()
+        actions = [None] + [item.get("daemon") for item in specs]
+        self.bar.touch_regions = self.bar.hit_regions(specs, actions)
+        region = next(r for r in self.bar.touch_regions
+                      if r["action"] == "slider:vol")
+        left = region["left"] + tb.BUTTON_SPACING / 2.0
+        width = region["right"] - tb.BUTTON_SPACING / 2.0 - left
+        x0, x1 = tb.slider_track(width)
+        self.assertTrue(self.bar.begin_drag(left + x0 + (x1 - x0) * 0.5))
+        self.assertEqual(self.bar.drag_level, 50)
+        self.bar.move_drag(left + x1 + 50)          # past the end clamps
+        self.assertEqual(self.bar.drag_level, 100)
+        self.bar.move_drag(left + x0 - 50)
+        self.assertEqual(self.bar.drag_level, 0)
+        self.bar.level_worker.join(2)
+        # The worker applies the newest level for each control; intermediate
+        # positions may be skipped but the last one always lands.
+        self.assertEqual(applied[-1], ("vol", 0))
+        self.bar.end_drag()
+        self.assertIsNone(self.bar.drag)
+        # A tap that lands off every slider is not claimed.
+        self.assertFalse(self.bar.begin_drag(left + 10))
 
     def test_fn_toggles_settings_and_restores_previous_page(self):
         self.bar.page = "auto"

@@ -15,7 +15,7 @@ elif [[ $# -gt 0 ]]; then
   exit 2
 fi
 
-for command in python3 hyprctl systemctl systemd-run wtype rsvg-convert; do
+for command in python3 hyprctl systemctl systemd-run wtype rsvg-convert brightnessctl wpctl; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Missing required command: $command" >&2
     exit 1

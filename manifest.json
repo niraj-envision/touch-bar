@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.niraj-envision.touch-bar",
+  "name": "Touch Bar",
+  "version": "2.0.0",
+  "author": "niraj-envision",
+  "license": "MIT",
+  "description": "Context-aware, themed Touch Bar for T2 MacBooks: app shortcuts, live browser tabs, Claude Code telemetry, dictation, sliders, media and system vitals.",
+  "homepage": "https://github.com/niraj-envision/touch-bar",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Touch Bar",
+    "description": "Shows what the Touch Bar is doing and switches its pages; runs the installer when the daemon is not set up.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showLabel": true,
+      "pollInterval": 3
+    },
+    "schema": [
+      { "key": "showLabel", "type": "bool", "label": "Show page name" },
+      { "key": "pollInterval", "type": "int", "label": "Refresh interval (s)" }
+    ]
+  }
+}
