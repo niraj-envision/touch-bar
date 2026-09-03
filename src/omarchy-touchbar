@@ -615,12 +615,17 @@ def wtype_args(keys):
         key = key[3]
     elif len(key) == 1:
         key = key.lower()
+    # Small pauses between press, key and release, and one before wtype
+    # tears its virtual keyboard down: with no gap the compositor can drop
+    # the modifier release, leaving the focused app convinced Ctrl or Alt is
+    # still held so every click turns into a Ctrl-click.
     args = []
     for mod in mods:
-        args += ["-M", mod]
-    args += ["-k", key]
+        args += ["-M", mod, "-s", "20"]
+    args += ["-k", key, "-s", "20"]
     for mod in reversed(mods):
-        args += ["-m", mod]
+        args += ["-m", mod, "-s", "20"]
+    args += ["-s", "40"]
     return args
 
 
@@ -4000,10 +4005,11 @@ class TouchBar:
         because a slash command only registers at the start of an empty line.
         """
         try:
-            subprocess.run(["wtype", "-M", "ctrl", "-k", "a", "-m", "ctrl",
-                            "-k", "BackSpace"], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, check=False)
-            subprocess.run(["wtype", command, "-k", "Return"],
+            subprocess.run(["wtype", "-M", "ctrl", "-s", "20", "-k", "a", "-s", "20",
+                            "-m", "ctrl", "-s", "20", "-k", "BackSpace", "-s", "40"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False)
+            subprocess.run(["wtype", command, "-k", "Return", "-s", "40"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            check=False)
         except OSError as exc:
@@ -4060,7 +4066,7 @@ class TouchBar:
                 self.clear_dictation()
             return
         if action == "send" and self.voice_state == "review":
-            subprocess.run(["wtype", "-k", "Return"],
+            subprocess.run(["wtype", "-k", "Return", "-s", "40"],
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, check=False)
             self.voice_state = "idle"
@@ -4075,9 +4081,9 @@ class TouchBar:
             return
         # Select and clear the input. This is intentionally routed through a
         # daemon command because tiny-dfr actions are chords, not sequences.
-        subprocess.run(["wtype", "-M", "ctrl", "-k", "a", "-m", "ctrl",
-                        "-k", "BackSpace"], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
+        subprocess.run(["wtype", "-M", "ctrl", "-s", "20", "-k", "a", "-s", "20",
+                        "-m", "ctrl", "-s", "20", "-k", "BackSpace", "-s", "40"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.voice_state = "idle"
         self.render()
 
