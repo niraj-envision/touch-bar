@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""omarchy-touchbar-settings - a small desktop window for the Touch Bar.
+
+Everything the daemon reads from ~/.config/omarchy/touchbar.toml can be
+changed here: bar look, feature switches, per-app profiles and their
+buttons, and the built-in Premier League centre. Edits are written back
+in place - comments and ordering in the file survive - and the daemon
+repaints the moment the file is saved.
+
+The TOML editing lives in `ConfigFile`, which has no GTK dependency so it
+can be unit-tested; the window is built in `main()`.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tomllib
+
+HOME = os.path.expanduser("~")
+USER_CONFIG = os.path.join(HOME, ".config", "omarchy", "touchbar.toml")
+DIST_CONFIG = USER_CONFIG + ".dist"
+PL_CONFIG = os.path.join(HOME, ".config", "omarchy", "premier-league.json")
+PL_STANDINGS = os.path.join(HOME, ".cache", "omarchy-pl", "standings.json")
+DAEMON = os.path.join(HOME, ".local", "bin", "omarchy-touchbar")
+PREVIEW_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+                           "omarchy-touchbar-previews")
+
+FEATURES = (
+    ("dictation", "Dictation", "Microphone button and Touch-Bar-only Voxtype dictation"),
+    ("media", "Media transport", "Play, skip and mute wherever something is playing"),
+    ("claude", "Claude Code read-out", "Live session telemetry when a Claude session is focused"),
+    ("chatgpt", "ChatGPT telemetry", "Codex task state, context and rate limits"),
+    ("browser_tabs", "Live browser tabs", "Favicon tab strip for Zen and Firefox"),
+    ("football", "Premier League page", "Live scores, table, fixtures and your club"),
+    ("goal_celebrations", "Goal celebrations", "Full-bar stadium scene when a goal goes in"),
+)
+CLOCK_CHOICES = (("", "Off"), ("%H:%M", "24-hour"), ("%I:%M %p", "12-hour"))
+BATTERY_CHOICES = (("", "Off"), ("percentage", "Ring with percentage"), ("icon", "Ring only"))
+PAGES = ("auto", "apps", "system", "football", "settings", "fn", "workspaces",
+         "recording", "review", "goal")
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return '"%s"' % text
+
+
+class ConfigFile:
+    """Line-based editor for touchbar.toml that keeps comments intact.
+
+    The file is small and its shape is fixed (a [settings] table, an [icons]
+    table, an optional [football] table and [[profiles]] array tables), so
+    edits are made by rewriting single lines inside the right block rather
+    than round-tripping through a TOML writer that would drop every comment.
+    """
+
+    KEY = re.compile(r"^(\s*)([A-Za-z0-9_\-\"']+)\s*=")
+
+    def __init__(self, path=USER_CONFIG):
+        self.path = path
+        try:
+            with open(path) as handle:
+                self.text = handle.read()
+        except FileNotFoundError:
+            try:
+                with open(DIST_CONFIG) as handle:
+                    self.text = handle.read()
+            except FileNotFoundError:
+                self.text = "[settings]\n"
+        self.data = self.parse()
+
+    def parse(self):
+        try:
+            return tomllib.loads(self.text)
+        except tomllib.TOMLDecodeError:
+            return {}
+
+    # -- blocks -----------------------------------------------------------
+    def blocks(self):
+        """[(header, start line, end line)] where end is exclusive."""
+        lines = self.text.split("\n")
+        found = []
+        header = None
+        start = 0
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]") \
+                    and not stripped.startswith("[["):
+                if header is not None or index > 0:
+                    found.append((header, start, index))
+                header, start = stripped, index
+            elif stripped.startswith("[["):
+                if header is not None or index > 0:
+                    found.append((header, start, index))
+                header, start = stripped, index
+        found.append((header, start, len(lines)))
+        return lines, found
+
+    def profile_blocks(self):
+        lines, found = self.blocks()
+        out = []
+        for header, start, end in found:
+            if header != "[[profiles]]":
+                continue
+            name = ""
+            for line in lines[start:end]:
+                match = re.match(r'^\s*name\s*=\s*"((?:[^"\\]|\\.)*)"', line)
+                if match:
+                    name = match.group(1)
+                    break
+            out.append((name, start, end))
+        return lines, out
+
+    # -- edits ------------------------------------------------------------
+    def set_in_block(self, header, key, value):
+        lines, found = self.blocks()
+        for block_header, start, end in found:
+            if block_header != header:
+                continue
+            return self._set_lines(lines, start, end, key, value)
+        # No such table yet: append it after the settings block (or at the
+        # end), never inside an array-of-tables entry.
+        insert_at = len(lines)
+        for block_header, start, end in found:
+            if block_header == "[settings]":
+                insert_at = end
+                break
+        addition = ["", header, "%s = %s" % (key, toml_value(value))]
+        lines[insert_at:insert_at] = addition
+        self.text = "\n".join(lines)
+        return True
+
+    def _set_lines(self, lines, start, end, key, value):
+        rendered = "%s = %s" % (key, toml_value(value))
+        for index in range(start + 1, end):
+            match = self.KEY.match(lines[index])
+            if match and match.group(2).strip("\"'") == key:
+                comment = ""
+                tail = lines[index].split("#", 1)
+                if len(tail) > 1 and not re.search(r'"[^"]*#[^"]*"', lines[index]):
+                    comment = "  #" + tail[1]
+                lines[index] = match.group(1) + rendered + comment
+                self.text = "\n".join(lines)
+                return True
+        # Not present: add it as the last line of the block, before any
+        # trailing blank lines so the file keeps its spacing.
+        last = end
+        while last > start + 1 and not lines[last - 1].strip():
+            last -= 1
+        lines.insert(last, rendered)
+        self.text = "\n".join(lines)
+        return True
+
+    def set_setting(self, key, value):
+        return self.set_in_block("[settings]", key, value)
+
+    def set_football(self, key, value):
+        return self.set_in_block("[football]", key, value)
+
+    def set_profile(self, name, key, value):
+        lines, profiles = self.profile_blocks()
+        for profile_name, start, end in profiles:
+            if profile_name == name:
+                return self._set_lines(lines, start, end, key, value)
+        return False
+
+    def set_profile_buttons(self, name, buttons):
+        """Replace a profile's whole `buttons = [...]` array."""
+        lines, profiles = self.profile_blocks()
+        for profile_name, start, end in profiles:
+            if profile_name != name:
+                continue
+            rendered = ["buttons = ["]
+            for button in buttons:
+                fields = ["label = %s" % toml_value(button.get("label", "")),
+                          "keys = %s" % toml_value(button.get("keys", ""))]
+                for key in ("color", "background", "hint"):
+                    if button.get(key):
+                        fields.append("%s = %s" % (key, toml_value(button[key])))
+                if button.get("size"):
+                    fields.append("size = %d" % int(button["size"]))
+                rendered.append("  { %s }," % ", ".join(fields))
+            rendered.append("]")
+            first = None
+            for index in range(start + 1, end):
+                if re.match(r"^\s*buttons\s*=", lines[index]):
+                    first = index
+                    break
+            if first is None:
+                last = end
+                while last > start + 1 and not lines[last - 1].strip():
+                    last -= 1
+                lines[last:last] = rendered
+            else:
+                depth = 0
+                last = first
+                for index in range(first, end):
+                    depth += lines[index].count("[") - lines[index].count("]")
+                    last = index
+                    if depth <= 0:
+                        break
+                lines[first:last + 1] = rendered
+            self.text = "\n".join(lines)
+            return True
+        return False
+
+    def save(self):
+        """Refuse to write anything tomllib cannot read back."""
+        parsed = tomllib.loads(self.text)          # raises on a bad edit
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as handle:
+            handle.write(self.text if self.text.endswith("\n") else self.text + "\n")
+        os.replace(tmp, self.path)
+        self.data = parsed
+        return parsed
+
+
+def clubs():
+    """(abbr, name) pairs from the standings cache, else a built-in list."""
+    try:
+        with open(PL_STANDINGS) as handle:
+            raw = json.load(handle)
+        kids = raw.get("children") or []
+        entries = ((kids[0].get("standings") or {}).get("entries") or []) if kids else []
+        rows = [((e.get("team") or {}).get("abbreviation", ""),
+                 (e.get("team") or {}).get("displayName", "")) for e in entries]
+        rows = [r for r in rows if r[0]]
+        if rows:
+            return sorted(rows, key=lambda r: r[1])
+    except (OSError, ValueError, AttributeError):
+        pass
+    return [("ARS", "Arsenal"), ("AVL", "Aston Villa"), ("BOU", "Bournemouth"),
+            ("BRE", "Brentford"), ("BHA", "Brighton"), ("BUR", "Burnley"),
+            ("CHE", "Chelsea"), ("CRY", "Crystal Palace"), ("EVE", "Everton"),
+            ("FUL", "Fulham"), ("LEE", "Leeds"), ("LIV", "Liverpool"),
+            ("MNC", "Manchester City"), ("MAN", "Manchester United"),
+            ("NEW", "Newcastle"), ("NFO", "Nottingham Forest"), ("SUN", "Sunderland"),
+            ("TOT", "Tottenham"), ("WHU", "West Ham"), ("WOL", "Wolves")]
+
+
+def plugin_club():
+    try:
+        with open(PL_CONFIG) as handle:
+            return str((json.load(handle) or {}).get("teamAbbr") or "").upper()
+    except (OSError, ValueError):
+        return ""
+
+
+def daemon_active():
+    try:
+        out = subprocess.run(["systemctl", "--user", "is-active", "omarchy-touchbar"],
+                             capture_output=True, text=True, timeout=3).stdout.strip()
+        return out == "active"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# ------------------------------------------------------------------ window --
+def main():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+    class Window(Adw.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Touch Bar", default_width=760,
+                             default_height=640)
+            self.config = ConfigFile()
+            self.save_pending = None
+            self.stack = Adw.ViewStack()
+            switcher = Adw.ViewSwitcher(stack=self.stack,
+                                        policy=Adw.ViewSwitcherPolicy.WIDE)
+            header = Adw.HeaderBar(title_widget=switcher)
+            restart = Gtk.Button(icon_name="view-refresh-symbolic",
+                                 tooltip_text="Restart the Touch Bar daemon")
+            restart.connect("clicked", lambda *_: self.restart_daemon())
+            header.pack_end(restart)
+            self.toast = Adw.ToastOverlay()
+            view = Adw.ToolbarView()
+            view.add_top_bar(header)
+            view.set_content(self.toast)
+            self.toast.set_child(self.stack)
+            self.set_content(view)
+            self.stack.add_titled_with_icon(self.bar_page(), "bar", "Bar",
+                                            "preferences-desktop-display-symbolic")
+            self.stack.add_titled_with_icon(self.features_page(), "features", "Features",
+                                            "emblem-system-symbolic")
+            self.stack.add_titled_with_icon(self.apps_page(), "apps", "Apps",
+                                            "view-grid-symbolic")
+            self.stack.add_titled_with_icon(self.football_page(), "football", "Football",
+                                            "applications-games-symbolic")
+            self.stack.add_titled_with_icon(self.preview_page(), "preview", "Preview",
+                                            "camera-photo-symbolic")
+
+        # -- plumbing -------------------------------------------------------
+        def settings(self):
+            return self.config.data.get("settings", {})
+
+        def queue_save(self):
+            """Coalesce a burst of edits into one write; the daemon repaints
+            on every save, so typing a font name should not repaint per key."""
+            if self.save_pending:
+                GLib.source_remove(self.save_pending)
+            self.save_pending = GLib.timeout_add(400, self.flush_save)
+
+        def flush_save(self):
+            self.save_pending = None
+            try:
+                self.config.save()
+            except (tomllib.TOMLDecodeError, OSError) as exc:
+                self.toast.add_toast(Adw.Toast(title="Could not save: %s" % exc))
+            return False
+
+        def set_setting(self, key, value):
+            self.config.set_setting(key, value)
+            self.queue_save()
+
+        def restart_daemon(self):
+            subprocess.Popen(["systemctl", "--user", "restart", "omarchy-touchbar"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.toast.add_toast(Adw.Toast(title="Touch Bar daemon restarting"))
+
+        def switch_row(self, title, subtitle, value, on_change):
+            row = Adw.SwitchRow(title=title, subtitle=subtitle, active=bool(value))
+            row.connect("notify::active", lambda r, _: on_change(r.get_active()))
+            return row
+
+        def spin_row(self, title, subtitle, value, lower, upper, on_change, step=1):
+            row = Adw.SpinRow.new_with_range(lower, upper, step)
+            row.set_title(title)
+            row.set_subtitle(subtitle)
+            row.set_value(float(value))
+            row.connect("notify::value", lambda r, _: on_change(r.get_value()))
+            return row
+
+        def entry_row(self, title, value, on_change):
+            row = Adw.EntryRow(title=title, text=str(value or ""))
+            row.connect("changed", lambda r: on_change(r.get_text()))
+            return row
+
+        def combo_row(self, title, subtitle, choices, current, on_change):
+            row = Adw.ComboRow(title=title, subtitle=subtitle)
+            model = Gtk.StringList.new([label for _, label in choices])
+            row.set_model(model)
+            keys = [key for key, _ in choices]
+            row.set_selected(keys.index(current) if current in keys else 0)
+            row.connect("notify::selected",
+                        lambda r, _: on_change(keys[r.get_selected()]))
+            return row
+
+        # -- pages ----------------------------------------------------------
+        def bar_page(self):
+            page = Adw.PreferencesPage()
+            s = self.settings()
+            look = Adw.PreferencesGroup(title="Look",
+                                        description="Colours always follow the Omarchy theme.")
+            look.add(self.entry_row("Text font", s.get("text_font", "Adwaita Sans"),
+                                    lambda v: self.set_setting("text_font", v)))
+            look.add(self.entry_row("Glyph font", s.get("font", "JetBrainsMono Nerd Font"),
+                                    lambda v: self.set_setting("font", v)))
+            look.add(self.spin_row("Corner radius", "Pill rounding in pixels",
+                                   s.get("corner_radius", 13), 0, 29,
+                                   lambda v: self.set_setting("corner_radius", int(v))))
+            look.add(self.switch_row("Animate changes", "Buttons pop when their contents change",
+                                     s.get("animate", True),
+                                     lambda v: self.set_setting("animate", v)))
+            page.add(look)
+            panel = Adw.PreferencesGroup(title="Panel")
+            panel.add(self.switch_row("Adaptive brightness", "Let tiny-dfr follow ambient light",
+                                      s.get("adaptive_brightness", True),
+                                      lambda v: self.set_setting("adaptive_brightness", v)))
+            panel.add(self.spin_row("Active brightness", "0 to 255 while the bar is in use",
+                                    s.get("active_brightness", 128), 1, 255,
+                                    lambda v: self.set_setting("active_brightness", int(v))))
+            panel.add(self.combo_row("Clock", "Themed clock beside the mode button",
+                                     CLOCK_CHOICES, s.get("clock", ""),
+                                     lambda v: self.set_setting("clock", v)))
+            panel.add(self.combo_row("Battery", "Themed battery ring beside the mode button",
+                                     BATTERY_CHOICES, s.get("battery", ""),
+                                     lambda v: self.set_setting("battery", v)))
+            page.add(panel)
+            layout = Adw.PreferencesGroup(title="Layout")
+            layout.add(self.spin_row("Workspaces", "Workspace buttons shown by default",
+                                     s.get("workspaces", 5), 1, 10,
+                                     lambda v: self.set_setting("workspaces", int(v))))
+            layout.add(self.spin_row("Most workspaces", "Grow up to this many when occupied",
+                                     s.get("max_workspaces", 5), 1, 10,
+                                     lambda v: self.set_setting("max_workspaces", int(v))))
+            layout.add(self.spin_row("Window buttons", "Jump-to-window buttons, most recent first",
+                                     s.get("windows", 4), 0, 8,
+                                     lambda v: self.set_setting("windows", int(v))))
+            layout.add(self.spin_row("Claude spinner", "Seconds per frame while Claude works",
+                                     s.get("claude_spinner", 0.45), 0.2, 2.0,
+                                     lambda v: self.set_setting("claude_spinner", round(v, 2)),
+                                     step=0.05))
+            page.add(layout)
+            return page
+
+        def features_page(self):
+            page = Adw.PreferencesPage()
+            group = Adw.PreferencesGroup(
+                title="What the bar does",
+                description="Switch a feature off and its buttons disappear; the "
+                            "rest of the bar takes the room.")
+            s = self.settings()
+            for key, title, subtitle in FEATURES:
+                group.add(self.switch_row(title, subtitle, s.get(key, True),
+                                          lambda v, key=key: self.set_setting(key, v)))
+            page.add(group)
+            return page
+
+        def apps_page(self):
+            page = Adw.PreferencesPage()
+            group = Adw.PreferencesGroup(
+                title="Supported apps",
+                description="Each profile matches a window class and supplies the "
+                            "shortcut buttons shown while that app is focused. Keys are "
+                            "chords such as CTRL+SHIFT+Tab, SUPER+Return or PlayPause.")
+            raw_profiles = [p for p in tomllib.loads(self.config.text).get("profiles", [])
+                            if isinstance(p, dict) and p.get("name")]
+            for profile in raw_profiles:
+                group.add(self.profile_row(profile))
+            page.add(group)
+            return page
+
+        def profile_row(self, profile):
+            name = profile["name"]
+            row = Adw.ExpanderRow(title=name,
+                                  subtitle=profile.get("match") or profile.get("match_title")
+                                  or ("Claude Code sessions" if profile.get("claude") else
+                                      "everything else" if profile.get("default") else ""))
+            row.set_show_enable_switch(True)
+            row.set_enable_expansion(profile.get("enabled", True) is not False)
+            row.connect("notify::enable-expansion",
+                        lambda r, _: self.set_profile(name, "enabled", r.get_enable_expansion()))
+            if not profile.get("default"):
+                row.add_row(self.entry_row("Window class pattern", profile.get("match", ""),
+                                           lambda v: self.set_profile(name, "match", v)))
+            row.add_row(self.entry_row("Icon glyph", profile.get("icon", ""),
+                                       lambda v: self.set_profile(name, "icon", v)))
+            row.add_row(self.switch_row("Collapse workspaces",
+                                        "Fold the switcher into one pill for this app",
+                                        profile.get("collapse_workspaces", False),
+                                        lambda v: self.set_profile(name, "collapse_workspaces", v)))
+            buttons = [dict(b) for b in profile.get("buttons", []) if isinstance(b, dict)]
+            holder = {"buttons": buttons, "rows": []}
+
+            def commit():
+                self.config.set_profile_buttons(name, holder["buttons"])
+                self.queue_save()
+
+            def add_button_rows(button):
+                label_row = Adw.EntryRow(title="Label", text=str(button.get("label", "")))
+                keys_row = Adw.EntryRow(title="Keys", text=str(button.get("keys", "")))
+                hint = str(button.get("hint") or "")
+                if hint:
+                    keys_row.set_title("Keys · %s" % hint)
+                remove = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                                    tooltip_text="Remove this button")
+                remove.add_css_class("flat")
+                keys_row.add_suffix(remove)
+
+                def on_label(r):
+                    button["label"] = r.get_text()
+                    commit()
+
+                def on_keys(r):
+                    button["keys"] = r.get_text()
+                    commit()
+
+                def on_remove(*_):
+                    holder["buttons"].remove(button)
+                    row.remove(label_row)
+                    row.remove(keys_row)
+                    commit()
+
+                label_row.connect("changed", on_label)
+                keys_row.connect("changed", on_keys)
+                remove.connect("clicked", on_remove)
+                row.add_row(label_row)
+                row.add_row(keys_row)
+
+            for button in buttons:
+                add_button_rows(button)
+            add = Adw.ButtonRow(title="Add button")
+            add.set_start_icon_name("list-add-symbolic")
+
+            def on_add(*_):
+                button = {"label": "", "keys": ""}
+                holder["buttons"].append(button)
+                row.remove(add)
+                add_button_rows(button)
+                row.add_row(add)
+                commit()
+
+            add.connect("activated", on_add)
+            row.add_row(add)
+            return row
+
+        def set_profile(self, name, key, value):
+            self.config.set_profile(name, key, value)
+            self.queue_save()
+
+        def football_page(self):
+            page = Adw.PreferencesPage()
+            s = self.settings()
+            f = self.config.data.get("football", {})
+            group = Adw.PreferencesGroup(
+                title="Premier League",
+                description="Built in: no companion app needed. Scores come from the "
+                            "public ESPN feed and are cached on disk.")
+            choices = [("", "Follow the Football plugin (%s)" % (plugin_club() or "none picked"))]
+            choices += [(abbr, "%s (%s)" % (label, abbr)) for abbr, label in clubs()]
+            group.add(self.combo_row("Your club", "Highlighted everywhere, with its own view",
+                                     choices, str(f.get("team", "")).upper(),
+                                     lambda v: self.set_football("team", v)))
+            group.add(self.switch_row("Football page", "Show the live centre in the page cycle",
+                                      s.get("football", True),
+                                      lambda v: self.set_setting("football", v)))
+            group.add(self.switch_row("Goal celebrations",
+                                      "Take over the whole bar for five seconds per goal",
+                                      s.get("goal_celebrations", True),
+                                      lambda v: self.set_setting("goal_celebrations", v)))
+            group.add(self.spin_row("Live refresh", "Seconds between polls while a match is on",
+                                    f.get("live_refresh", 25), 15, 120,
+                                    lambda v: self.set_football("live_refresh", int(v))))
+            group.add(self.spin_row("Idle refresh", "Seconds between polls otherwise",
+                                    f.get("idle_refresh", 300), 60, 3600,
+                                    lambda v: self.set_football("idle_refresh", int(v))))
+            page.add(group)
+            return page
+
+        def set_football(self, key, value):
+            self.config.set_football(key, value)
+            self.queue_save()
+
+        def preview_page(self):
+            page = Adw.PreferencesPage()
+            group = Adw.PreferencesGroup(
+                title="Preview",
+                description="Rendered exactly as the panel draws it, from the saved "
+                            "configuration and the current theme.")
+            picker = Adw.ComboRow(title="Page")
+            picker.set_model(Gtk.StringList.new(list(PAGES)))
+            group.add(picker)
+            status = Adw.ActionRow(title="Daemon",
+                                   subtitle="running" if daemon_active() else "not running")
+            group.add(status)
+            page.add(group)
+            frame = Adw.PreferencesGroup()
+            picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True)
+            picture.set_size_request(-1, 90)
+            picture.add_css_class("card")
+            frame.add(picture)
+            page.add(frame)
+
+            def render(*_):
+                name = PAGES[picker.get_selected()]
+                os.makedirs(PREVIEW_DIR, exist_ok=True)
+                out = os.path.join(PREVIEW_DIR, name + ".png")
+                try:
+                    subprocess.run([DAEMON, "preview", name, out], check=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=20)
+                    picture.set_filename(out)
+                except (OSError, subprocess.SubprocessError):
+                    self.toast.add_toast(Adw.Toast(title="Preview failed; is the daemon installed?"))
+                status.set_subtitle("running" if daemon_active() else "not running")
+
+            picker.connect("notify::selected", render)
+            refresh = Adw.ButtonRow(title="Render again")
+            refresh.set_start_icon_name("view-refresh-symbolic")
+            refresh.connect("activated", render)
+            group.add(refresh)
+            GLib.idle_add(render)
+            return page
+
+    class App(Adw.Application):
+        def __init__(self):
+            super().__init__(application_id="io.github.niraj_envision.TouchBarSettings",
+                             flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+        def do_activate(self):
+            window = self.props.active_window or Window(self)
+            window.present()
+            wanted = sys.argv[1] if len(sys.argv) > 1 else ""
+            if wanted in ("bar", "features", "apps", "football", "preview"):
+                # After present(), or the switcher's initial selection wins.
+                GLib.idle_add(lambda: window.stack.set_visible_child_name(wanted) and False)
+
+    return App().run(sys.argv[:1])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

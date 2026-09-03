@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Touch Bar
+Comment=Configure the Omarchy Touch Bar: look, features, apps and football
+Exec=omarchy-touchbar-settings
+Icon=input-keyboard
+Terminal=false
+Categories=Settings;DesktopSettings;GTK;
+Keywords=touchbar;tiny-dfr;macbook;

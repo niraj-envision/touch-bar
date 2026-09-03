@@ -11,7 +11,7 @@
 # accent, on_accent, fg, muted - or any colour name from the theme's
 # colors.toml (red, green, yellow, blue, magenta, cyan, orange), or a #hex.
 #
-#   omarchy-touchbar page next     smart bar -> apps -> vitals -> controls -> F-keys
+#   omarchy-touchbar page next     smart bar -> apps -> vitals -> football -> controls -> F-keys
 #   omarchy-touchbar preview       render a PNG mock-up of the bar
 #   omarchy-touchbar preview system|settings|apps|fn|recording|review|goal
 # Tap fn to open the controls page: brightness, keyboard light and volume
@@ -41,6 +41,23 @@ active_brightness = 128
 clock = ""                  # e.g. "%H:%M": a themed clock with the date beneath
 battery = ""                # "percentage" or "icon": a themed battery ring
 
+# Feature switches (also in the Touch Bar Settings app).
+dictation = true            # microphone button and Touch-Bar-only dictation
+media = true                # MPRIS transport wherever something is playing
+claude = true               # Claude Code read-out when a session is focused
+chatgpt = true              # ChatGPT/Codex telemetry tiles
+browser_tabs = true         # live favicon tab strip in Firefox-family browsers
+football = true             # Premier League page in the mode cycle
+goal_celebrations = true    # full-bar goal scene when a PL goal is scored
+
+# Built-in Premier League live centre: live scores, table, fixtures and your
+# club, refreshed off the render path. Leave `team` empty to follow the club
+# picked in the Football plugin (~/.config/omarchy/premier-league.json).
+[football]
+team = ""                   # club abbreviation, e.g. "LIV", "ARS", "MNC"
+live_refresh = 25           # seconds between polls while a match is on
+idle_refresh = 300          # seconds otherwise
+
 # Glyphs for the window buttons: [glyph, colour], matched on window class in order.
 [icons]
 "^(zen|firefox|librewolf)" = ["", "yellow"]
@@ -53,6 +70,7 @@ battery = ""                # "percentage" or "icon": a themed battery ring
 "^(code|Code|VSCodium)" = ["", "cyan"]
 "^(steam|Steam)" = ["", "muted"]
 "^(chatgpt|ChatGPT)$" = ["󰭹", "green"]
+"^org\\.omarchy\\.premier-league$" = ["", "green"]
 
 # ---------------------------------------------------------------- profiles --
 # The first profile whose `match` hits the focused window's class wins.
@@ -100,6 +118,14 @@ buttons = [
   { label = "@",      keys = "SHIFT+2",   size = 25, hint = "Mention a file" },
   { label = "!",      keys = "SHIFT+1",   size = 27, color = "green", hint = "Bash mode" },
 ]
+
+[[profiles]]
+name = "Football"
+# The Football plugin's terminal scorecard: the bar becomes the live centre.
+match = "^org\\.omarchy\\.premier-league$"
+football = true
+icon = ""
+icon_color = "green"
 
 [[profiles]]
 name = "Terminal"

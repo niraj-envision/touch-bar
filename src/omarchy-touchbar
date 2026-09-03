@@ -15,7 +15,9 @@ come from the current Omarchy theme.
   omarchy-touchbar render     repaint once
   omarchy-touchbar page next|auto|fn|workspaces
   omarchy-touchbar focus N    focus the window in the Nth window slot
-  omarchy-touchbar preview    write a PNG mock-up of the bar and print its path
+  omarchy-touchbar preview [page] [out.png]   write a PNG mock-up of a page
+  omarchy-touchbar football [live|table|fixtures|club|refresh]
+  omarchy-touchbar settings   open the desktop settings window
   omarchy-touchbar status     show what the bar is currently showing
 """
 
@@ -61,7 +63,7 @@ _HYPR_DIR_CACHE = None
 _HYPR_ERROR = None
 _HYPR_STATE_LOCK = threading.Lock()
 
-PAGES = ("auto", "apps", "system", "settings", "fn")
+PAGES = ("auto", "apps", "system", "football", "settings", "fn")
 
 # The panel is 2170x60. tiny-dfr splits it into equal cells separated by
 # BUTTON_SPACING_PX, and prepends an "esc" button of its own on panels this
@@ -171,9 +173,18 @@ DEFAULTS = {
         "windows": 4,
         "clock": "",
         "battery": "",
+        # Feature switches, also driven by omarchy-touchbar-settings.
+        "dictation": True,
+        "media": True,
+        "claude": True,
+        "chatgpt": True,
+        "browser_tabs": True,
+        "football": True,
+        "goal_celebrations": True,
     },
     "icons": {},
     "profiles": [],
+    "football": {},
 }
 
 FALLBACK_THEME = {
@@ -202,7 +213,9 @@ def load_config():
     user = load_toml(USER_CONFIG, {})
     cfg["settings"].update(user.get("settings", {}))
     cfg["icons"] = user.get("icons", {})
-    cfg["profiles"] = user.get("profiles", [])
+    cfg["profiles"] = [p for p in user.get("profiles", [])
+                       if isinstance(p, dict) and p.get("enabled", True) is not False]
+    cfg["football"] = user.get("football", {}) if isinstance(user.get("football"), dict) else {}
     return cfg
 
 
@@ -1241,6 +1254,400 @@ def transcript_for(cwd):
     return max(found, key=os.path.getmtime) if found else None
 
 
+# --------------------------------------------------------- premier league --
+# A built-in live centre so the bar needs no companion app. It talks to the
+# same public ESPN endpoints the Football plugin uses, shares its on-disk
+# cache directory (so both installed together fetch once), and follows the
+# club chosen in either ~/.config/omarchy/touchbar.toml [football] or the
+# Football plugin's premier-league.json.
+PL_LEAGUE = "eng.1"
+PL_API = "https://site.api.espn.com/apis"
+PL_HOSTS = {"site.api.espn.com"}
+PL_CACHE_DIR = os.path.join(HOME, ".cache", "omarchy-pl")
+PL_CONFIG = os.path.join(HOME, ".config", "omarchy", "premier-league.json")
+PL_SEEN = os.path.join(HOME, ".local", "state", "omarchy-touchbar", "pl-seen.json")
+PL_UA = "Mozilla/5.0 (X11; Linux x86_64) omarchy-touchbar/2.1"
+PL_MAX_BYTES = 2 * 1024 * 1024
+CLUB_COLORS = {
+    "ARS": "#EF0107", "AVL": "#95BFE5", "BOU": "#DA291C", "BRE": "#E30613",
+    "BHA": "#0057B8", "BUR": "#6C1D45", "CHE": "#034694", "CRY": "#1B458F",
+    "EVE": "#003399", "FUL": "#CC0000", "IPS": "#3A64A3", "LEE": "#FFCD00",
+    "LEI": "#003090", "LIV": "#C8102E", "MNC": "#6CABDD", "MNU": "#DA291C",
+    "MAN": "#DA291C", "NEW": "#41B6E6", "NFO": "#DD0000", "SOU": "#D71920",
+    "TOT": "#132257", "WHU": "#7A263A", "WOL": "#FDB913", "SHU": "#EE2737",
+    "LUT": "#F78F1E", "COV": "#78D0F3", "HUL": "#F5A12D", "MID": "#DE1B22",
+    "SUN": "#EB172B", "WBA": "#122F67", "STO": "#E03A3E", "NOR": "#00A650",
+    "WAT": "#FBEE23",
+}
+FOOTBALL_VIEWS = ("live", "table", "fixtures", "club")
+
+
+def pl_fetch(url, key, ttl, force=False):
+    """GET JSON through an on-disk cache; stale cache beats an error."""
+    os.makedirs(PL_CACHE_DIR, exist_ok=True)
+    path = os.path.join(PL_CACHE_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_", key) + ".json")
+    if not force:
+        try:
+            if time.time() - os.path.getmtime(path) < ttl:
+                with open(path) as handle:
+                    return json.load(handle)
+        except (OSError, ValueError):
+            pass
+    import urllib.request
+    request = urllib.request.Request(
+        url, headers={"User-Agent": PL_UA, "Accept": "application/json"})
+    try:
+        if urllib.parse.urlparse(url).hostname not in PL_HOSTS:
+            raise ValueError("unexpected API origin")
+        with urllib.request.urlopen(request, timeout=12) as response:
+            if urllib.parse.urlparse(response.geturl()).hostname not in PL_HOSTS:
+                raise ValueError("API redirected elsewhere")
+            raw = response.read(PL_MAX_BYTES + 1)
+            if len(raw) > PL_MAX_BYTES:
+                raise ValueError("API response exceeds 2 MiB")
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("API response is not an object")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as handle:
+            json.dump(data, handle)
+        os.replace(tmp, path)
+        return data
+    except Exception as exc:                                # noqa: BLE001
+        try:
+            with open(path) as handle:
+                return json.load(handle)
+        except (OSError, ValueError):
+            raise RuntimeError(str(exc)) from exc
+
+
+def pl_parse_utc(stamp):
+    for fmt in ("%Y-%m-%dT%H:%MZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return calendar.timegm(time.strptime(stamp or "", fmt))
+        except (ValueError, TypeError):
+            continue
+    return 0
+
+
+def pl_team_color(team, fallback):
+    known = CLUB_COLORS.get((team.get("abbreviation") or "").upper())
+    if known:
+        return known
+    color = (team.get("color") or "").strip()
+    if color and color.lower() not in ("000000", "ffffff", "none"):
+        return "#" + color.lstrip("#")
+    return fallback
+
+
+def pl_parse_event(event, fallback_color):
+    comp = (event.get("competitions") or [{}])[0]
+    status = event.get("status") or comp.get("status") or {}
+    stype = status.get("type") or {}
+    home = away = None
+    for side in comp.get("competitors") or []:
+        team = side.get("team") or {}
+        parsed = {
+            "id": str(team.get("id", "")),
+            "abbr": team.get("abbreviation", "???"),
+            "name": team.get("shortDisplayName") or team.get("displayName", "?"),
+            "full": team.get("displayName", "?"),
+            "score": side.get("score"),
+            "form": side.get("form") or "",
+            "color": pl_team_color(team, fallback_color),
+        }
+        if side.get("homeAway") == "home":
+            home = parsed
+        else:
+            away = parsed
+    goals = []
+    for detail in comp.get("details") or []:
+        if not detail.get("scoringPlay"):
+            continue
+        who = (detail.get("athletesInvolved") or [{}])[0]
+        goals.append({
+            "team": str((detail.get("team") or {}).get("id", "")),
+            "clock": (detail.get("clock") or {}).get("displayValue", ""),
+            "player": who.get("shortName") or who.get("displayName") or "",
+            "own": bool(detail.get("ownGoal")),
+            "pen": bool(detail.get("penaltyKick")),
+        })
+    venue = comp.get("venue") or event.get("venue") or {}
+    return {
+        "id": str(event.get("id", "")),
+        "kickoff": pl_parse_utc(event.get("date")),
+        "state": stype.get("state", "pre"),          # pre | in | post
+        "detail": stype.get("shortDetail", ""),
+        "clock": status.get("displayClock", ""),
+        "home": home, "away": away, "goals": goals,
+        "venue": venue.get("fullName", ""),
+    }
+
+
+def pl_score(match):
+    def number(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+    return number(match["home"].get("score")), number(match["away"].get("score"))
+
+
+class PremierLeague:
+    """Live scores, the table and your club, refreshed off the render path."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.events = []
+        self.table = []
+        self.fetched = 0.0
+        self.error = ""
+        self.team_abbr = ""
+        self.team_id = ""
+        self.enabled = True
+        self.celebrations = True
+        self.live_refresh = 25
+        self.idle_refresh = 300
+        self.seen = None                     # goal keys; None until the baseline
+        self.fallback_color = "#7daea3"
+
+    def configure(self, settings, section):
+        section = section or {}
+        self.enabled = bool(settings.get("football", True))
+        self.celebrations = bool(settings.get("goal_celebrations", True))
+        self.live_refresh = max(15, int(section.get("live_refresh", 25) or 25))
+        self.idle_refresh = max(60, int(section.get("idle_refresh", 300) or 300))
+        team = str(section.get("team") or "").strip().upper()
+        if not team:
+            try:
+                with open(PL_CONFIG) as handle:
+                    plugin = json.load(handle) or {}
+                team = str(plugin.get("teamAbbr") or "").upper()
+                self.team_id = str(plugin.get("teamId") or "")
+            except (OSError, ValueError):
+                pass
+        self.team_abbr = team
+
+    # -- data -------------------------------------------------------------
+    def refresh(self, force=False):
+        """Fetch the scoreboard and standings. Returns True when anything
+        visible changed. Network errors keep the last good data."""
+        now = time.time()
+        start = time.strftime("%Y%m%d", time.gmtime(now - 30 * 86400))
+        end = time.strftime("%Y%m%d", time.gmtime(now + 40 * 86400))
+        url = "%s/site/v2/sports/soccer/%s/scoreboard?dates=%s-%s&limit=400" % (
+            PL_API, PL_LEAGUE, start, end)
+        try:
+            # Own cache key: the Football plugin caches the same endpoint with
+            # a different date window, and reading each other's file would
+            # make old results look new to whichever goal detector ran next.
+            data = pl_fetch(url, "touchbar-events", 0 if force else 60, force)
+            events = [pl_parse_event(item, self.fallback_color)
+                      for item in data.get("events") or []]
+            events = [e for e in events if e["kickoff"] and e["home"] and e["away"]]
+            events.sort(key=lambda e: e["kickoff"])
+            self.error = ""
+        except RuntimeError as exc:
+            self.error = str(exc)
+            events = None
+        table = None
+        try:
+            raw = pl_fetch("%s/v2/sports/soccer/%s/standings" % (PL_API, PL_LEAGUE),
+                           "standings", 900, force)
+            table = self.parse_table(raw)
+        except RuntimeError:
+            pass
+        with self.lock:
+            before = self.signature()
+            if events is not None:
+                self.events = events
+            if table:
+                self.table = table
+            self.fetched = time.monotonic()
+            changed = self.signature() != before
+        return changed
+
+    def parse_table(self, raw):
+        kids = raw.get("children") or []
+        entries = ((kids[0].get("standings") or {}).get("entries") or []) if kids else []
+        rows = []
+        for entry in entries:
+            stats = {s.get("name"): s for s in entry.get("stats") or []}
+
+            def val(name, default=0):
+                item = stats.get(name) or {}
+                try:
+                    return int(float(item.get("value", item.get("displayValue", default))))
+                except (TypeError, ValueError):
+                    return default
+
+            team = entry.get("team") or {}
+            rows.append({
+                "id": str(team.get("id", "")),
+                "name": team.get("shortDisplayName") or team.get("displayName", "?"),
+                "abbr": team.get("abbreviation", "???"),
+                "color": pl_team_color(team, self.fallback_color),
+                "rank": val("rank", 99), "played": val("gamesPlayed"),
+                "won": val("wins"), "drawn": val("ties"), "lost": val("losses"),
+                "gf": val("pointsFor"), "ga": val("pointsAgainst"),
+                "gd": val("pointDifferential"), "pts": val("points"),
+            })
+        rows.sort(key=lambda r: r["rank"])
+        return rows
+
+    def signature(self):
+        return (tuple((e["id"], e["state"], e["clock"], pl_score(e), len(e["goals"]))
+                      for e in self.events),
+                tuple((r["abbr"], r["pts"], r["gd"]) for r in self.table))
+
+    # -- queries ----------------------------------------------------------
+    def is_club(self, side):
+        return bool(self.team_abbr) and (side.get("abbr") or "").upper() == self.team_abbr
+
+    def involves_club(self, match):
+        return self.is_club(match["home"]) or self.is_club(match["away"])
+
+    def live(self):
+        return [e for e in self.events if e["state"] == "in"]
+
+    def any_live(self):
+        return any(e["state"] == "in" for e in self.events)
+
+    def next_kickoff_in(self):
+        now = time.time()
+        pending = [e["kickoff"] - now for e in self.events
+                   if e["state"] == "pre" and e["kickoff"] >= now - 300]
+        return min(pending) if pending else None
+
+    def upcoming(self, limit=12):
+        now = time.time() - 300
+        return [e for e in self.events if e["state"] == "pre" and e["kickoff"] >= now][:limit]
+
+    def recent(self, limit=6):
+        done = [e for e in self.events if e["state"] == "post"]
+        return list(reversed(done[-limit:]))
+
+    def club_row(self):
+        for row in self.table:
+            if (row["abbr"] or "").upper() == self.team_abbr:
+                return row
+        return None
+
+    def club_matches(self):
+        return [e for e in self.events if self.involves_club(e)]
+
+    def club_next(self):
+        for match in self.club_matches():
+            if match["state"] == "in":
+                return match
+        now = time.time() - 300
+        for match in self.club_matches():
+            if match["state"] == "pre" and match["kickoff"] >= now:
+                return match
+        return None
+
+    def club_last(self):
+        done = [m for m in self.club_matches() if m["state"] == "post"]
+        return done[-1] if done else None
+
+    def club_form(self):
+        """Last five results as W/D/L, oldest first, from finished matches."""
+        letters = []
+        for match in [m for m in self.club_matches() if m["state"] == "post"][-5:]:
+            hs, as_ = pl_score(match)
+            mine, theirs = (hs, as_) if self.is_club(match["home"]) else (as_, hs)
+            letters.append("W" if mine > theirs else "L" if mine < theirs else "D")
+        return "".join(letters)
+
+    # -- goals ------------------------------------------------------------
+    @staticmethod
+    def goal_key(match, goal, index):
+        return "%s:%s:%s:%s:%s" % (match["id"], goal.get("team", ""),
+                                   goal.get("clock", ""), goal.get("player", ""), index)
+
+    def goal_payload(self, match, goal, index):
+        home, away = match["home"], match["away"]
+        scorer_team = home if goal.get("team") == home["id"] else away
+        hs = sum(1 for g in match["goals"][:index + 1] if g.get("team") == home["id"])
+        as_ = sum(1 for g in match["goals"][:index + 1] if g.get("team") == away["id"])
+        suffix = " (P)" if goal.get("pen") else (" (OG)" if goal.get("own") else "")
+        return {
+            "id": self.goal_key(match, goal, index), "kind": "goal",
+            "event": match["id"], "competition": "PL",
+            "home": home["full"], "homeAbbr": home["abbr"], "homeScore": hs,
+            "away": away["full"], "awayAbbr": away["abbr"], "awayScore": as_,
+            "team": scorer_team["full"], "teamAbbr": scorer_team["abbr"],
+            "teamColor": scorer_team.get("color") or self.fallback_color,
+            "scorer": (goal.get("player") or "Goal") + suffix,
+            "clock": goal.get("clock") or match.get("clock") or "LIVE",
+        }
+
+    def detect_goals(self, acked):
+        """Goals not seen before. The first pass is a silent baseline so a
+        restart never replays a whole afternoon of football."""
+        current = {}
+        payloads = []
+        fresh = time.time() - 4 * 3600
+        with self.lock:
+            for match in self.events:
+                if match["state"] not in ("in", "post"):
+                    continue
+                # Only a match in progress, or one that ended in the last few
+                # hours, can produce a celebration. Older results are learned
+                # silently, so a wider fetch window never replays old goals.
+                eligible = match["state"] == "in" or match["kickoff"] >= fresh
+                for index, goal in enumerate(match["goals"]):
+                    key = self.goal_key(match, goal, index)
+                    current[key] = True
+                    if eligible:
+                        payloads.append((key, match, goal, index))
+        if self.seen is None:
+            try:
+                with open(PL_SEEN) as handle:
+                    self.seen = set(json.load(handle).get("seen") or [])
+            except (OSError, ValueError, AttributeError):
+                self.seen = None
+        if self.seen is None:
+            self.seen = set(current)
+            self.save_seen()
+            return []
+        new = [self.goal_payload(match, goal, index)
+               for key, match, goal, index in payloads
+               if key not in self.seen and key not in acked][:20]
+        # Remember every key ever observed: a transiently short API response
+        # must not make an old goal look new when it comes back.
+        self.seen.update(current)
+        if len(self.seen) > 2000:
+            self.seen = set(list(self.seen)[-2000:])
+        self.save_seen()
+        return new
+
+    def save_seen(self):
+        try:
+            os.makedirs(os.path.dirname(PL_SEEN), exist_ok=True)
+            tmp = PL_SEEN + ".tmp"
+            with open(tmp, "w") as handle:
+                json.dump({"seen": sorted(self.seen or []), "updated": time.time()}, handle)
+            os.replace(tmp, PL_SEEN)
+        except OSError:
+            pass
+
+
+def pl_kickoff_caption(kickoff):
+    """'Sat 16:30 · 2d 3h' in local time."""
+    local = time.localtime(kickoff)
+    left = kickoff - time.time()
+    if left <= 0:
+        countdown = "now"
+    elif left >= 86400:
+        countdown = "%dd %dh" % (left // 86400, (left % 86400) // 3600)
+    elif left >= 3600:
+        countdown = "%dh %02dm" % (left // 3600, (left % 3600) // 60)
+    else:
+        countdown = "%dm" % max(1, left // 60)
+    return "%s · %s" % (time.strftime("%a %H:%M", local), countdown)
+
+
 # ------------------------------------------------------------- hyprland ipc --
 def _hypr_socket_candidates(name):
     """Return live, user-owned Hyprland sockets in preference order.
@@ -1697,6 +2104,26 @@ def build_svg(spec, width, radius, font, scale=1.0):
     else:
         body = text(BAR_HEIGHT / 2 + size * 0.36, label, size, fg)
 
+    edges = spec.get("edges")
+    if edges:
+        # Club colours as slim bars on the pill's flanks (home left, away right).
+        left_color, right_color = edges
+        if left_color:
+            body += ('<rect x="7" y="13" width="5" height="34" rx="2.5" fill="%s"/>'
+                     % html.escape(str(left_color)))
+        if right_color:
+            body += ('<rect x="%.2f" y="13" width="5" height="34" rx="2.5" fill="%s"/>'
+                     % (width - 12, html.escape(str(right_color))))
+    form = spec.get("form")
+    if form:
+        # Last results as dots, oldest first: win, draw, loss colours.
+        win, draw, loss = spec.get("form_colors", ("#a9b665", "#d8a657", "#ea6962"))
+        gap = 16.0
+        left = width / 2 - (len(form) - 1) * gap / 2
+        for index, letter in enumerate(form.upper()[:8]):
+            colour = win if letter == "W" else draw if letter == "D" else loss
+            body += ('<circle cx="%.2f" cy="27" r="6" fill="%s"/>'
+                     % (left + index * gap, colour))
     if spec.get("dots"):
         # A row of position dots along the bottom edge (page/workspace index).
         total, current = spec["dots"]
@@ -1887,6 +2314,14 @@ class TouchBar:
         self.goal_queue = deque()
         self.goal_active = None
         self.goal_animating = False
+        self.football = PremierLeague()
+        self.football.fallback_color = self.palette.color("accent")
+        self.football.configure(self.config["settings"], self.config["football"])
+        self.football_view = "live"
+        self.football_offset = {}
+        self.football_capacity = 0
+        self.football_total = 0
+        self.football_active = False
         # A finger riding a slider: (kind, track left px, track right px).
         self.drag = None
         self.drag_level = None
@@ -1917,6 +2352,8 @@ class TouchBar:
             self.config = load_config()
             self.palette = Palette(load_toml(THEME_COLORS, FALLBACK_THEME))
             self.stamps = stamps
+            self.football.fallback_color = self.palette.color("accent")
+            self.football.configure(self.config["settings"], self.config["football"])
             self.last_written = None      # colours may have changed everywhere
 
     # -- state ------------------------------------------------------------
@@ -1944,7 +2381,7 @@ class TouchBar:
     def claude_pid(self, active_win):
         """The `claude` process running under this window, if there is one."""
         pid = (active_win or {}).get("pid")
-        if not pid:
+        if not pid or not self.config["settings"].get("claude", True):
             return None
         known_pid, checked, found = self.claude_probe
         if known_pid == pid and time.monotonic() - checked < 4.0:
@@ -2017,6 +2454,9 @@ class TouchBar:
                     return profile
             except re.error:
                 continue
+        if re.search(r"^org\.omarchy\.premier-league$", window_class):
+            # Built in, so the Football TUI gets its page without a profile.
+            return {"name": "Football", "football": True}
         for profile in self.config["profiles"]:
             if profile.get("default"):
                 return profile
@@ -2058,7 +2498,7 @@ class TouchBar:
     def media_group(self):
         """Transport for whatever is playing, anywhere. Costs nothing when
         silent, and displaces the typing shortcuts rather than the read-out."""
-        if not self.media.active:
+        if not self.media.active or not self.config["settings"].get("media", True):
             return []
         title = self.media.title
         caption = title if len(title) <= 15 else title[:14] + "\u2026"
@@ -2180,7 +2620,7 @@ class TouchBar:
             # between it and the shortcuts, and so the shortcuts are what gets
             # squeezed when the bar runs out of room.
             return rows
-        if profile.get("name") == "ChatGPT":
+        if profile.get("name") == "ChatGPT" and self.config["settings"].get("chatgpt", True):
             return self.chatgpt_tiles() + rows
         return rows
 
@@ -2242,7 +2682,7 @@ class TouchBar:
 
     def voice_group(self):
         """A compact launcher; active dictation owns the full Touch Bar."""
-        if self.voice_state != "idle":
+        if self.voice_state != "idle" or not self.config["settings"].get("dictation", True):
             return []
         return [spec("", None, fill="sunken", fg="magenta", size=27,
                      daemon="voice:toggle")]
@@ -2336,6 +2776,9 @@ class TouchBar:
         return rows
 
     def browser_tab_group(self, profile, active_win, capacity):
+        if not self.config["settings"].get("browser_tabs", True):
+            self.browser_offset = 0
+            return self.tab_group(profile)[:capacity]
         self.browser.refresh(active_win)
         tabs = self.browser.tabs
         self.browser_capacity = max(1, capacity)
@@ -2427,13 +2870,14 @@ class TouchBar:
 
     def mode_group(self):
         icons = {"auto": "\U000f003b", "apps": "\uf17c",
-                 "system": "\U000f035b", "settings": "\uf1de", "fn": "\uf11c"}
+                 "system": "\U000f035b", "football": "\uf1e3",
+                 "settings": "\uf1de", "fn": "\uf11c"}
         colors = {"auto": "accent", "apps": "green", "system": "cyan",
-                  "settings": "yellow", "fn": "muted"}
-        position = PAGES.index(self.page) if self.page in PAGES else 0
+                  "football": "green", "settings": "yellow", "fn": "muted"}
+        position = self.pages().index(self.page) if self.page in self.pages() else 0
         rows = [spec(icons.get(self.page, "\uf11c"), None,
                      fill="sunken", fg=colors.get(self.page, "muted"), size=24,
-                     sub_fg="muted", dots=(len(PAGES), position),
+                     sub_fg="muted", dots=(len(self.pages()), position),
                      daemon="page:next")]
         settings = self.config["settings"]
         if settings.get("clock"):
@@ -2471,6 +2915,156 @@ class TouchBar:
                         "full" if status == "Full" else "battery",
                     sub_size=11, sub_fg="muted", daemon="page:system")
 
+    # -- football ---------------------------------------------------------
+    def pages(self):
+        """The mode-button cycle, minus pages that are switched off."""
+        if self.config["settings"].get("football", True):
+            return PAGES
+        return tuple(p for p in PAGES if p != "football")
+
+    def match_tile(self, match, stretch=2, action="football:view"):
+        """One fixture or live match as a tile with both clubs' colours."""
+        home, away = match["home"], match["away"]
+        hs, as_ = pl_score(match)
+        mine = self.football.involves_club(match)
+        if match["state"] == "in":
+            label = "%s %d-%d %s" % (home["abbr"], hs, as_, away["abbr"])
+            caption = "%s · live" % (match.get("clock") or "").strip("'") \
+                if match.get("clock") else "live"
+            fill, fg, sub_fg = ("accent", "on_accent", "on_accent") if mine \
+                else ("raised", "fg", "red")
+        elif match["state"] == "post":
+            label = "%s %d-%d %s" % (home["abbr"], hs, as_, away["abbr"])
+            caption = "full time"
+            fill, fg, sub_fg = "sunken", "fg", "muted"
+        else:
+            label = "%s v %s" % (home["abbr"], away["abbr"])
+            caption = pl_kickoff_caption(match["kickoff"])
+            fill, fg, sub_fg = ("surface", "fg", "accent") if mine \
+                else ("sunken", "fg", "muted")
+        return spec(label, None, fill=fill, fg=fg, size=21, gloss=fill != "sunken",
+                    sub=caption, sub_size=11, sub_fg=sub_fg, stretch=stretch,
+                    edges=(home["color"], away["color"]),
+                    glow=match["state"] == "in" and mine, daemon=action)
+
+    def table_tile(self, row):
+        rank = row["rank"]
+        zone = "green" if rank <= 4 else "cyan" if rank == 5 \
+            else "red" if rank >= 18 else "muted"
+        mine = (row["abbr"] or "").upper() == self.football.team_abbr
+        return spec(row["abbr"], None, fill="accent" if mine else "sunken",
+                    fg="on_accent" if mine else "fg", size=20, gloss=mine,
+                    sub="%d pts · %+d" % (row["pts"], row["gd"]), sub_size=11,
+                    sub_fg="on_accent" if mine else zone, badge=rank,
+                    edges=(row["color"], None), daemon="football:view")
+
+    def football_pages(self, items, capacity):
+        """Page a list for the current view and remember where we are."""
+        view = self.football_view
+        capacity = max(1, capacity)
+        last = ((max(1, len(items)) - 1) // capacity) * capacity
+        offset = max(0, min(self.football_offset.get(view, 0), last))
+        self.football_offset[view] = offset
+        self.football_capacity = capacity
+        self.football_total = len(items)
+        return items[offset:offset + capacity], offset
+
+    def page_football(self, embedded=False):
+        """Live scores, the table, fixtures and your club, one view at a time."""
+        pl = self.football
+        view = self.football_view
+        icons = {"live": "", "table": "", "fixtures": "",
+                 "club": ""}
+        titles = {"live": "live", "table": "table", "fixtures": "fixtures",
+                  "club": pl.team_abbr.lower() or "club"}
+        selector = spec(icons[view], None, fill="accent", fg="on_accent", size=24,
+                        sub=titles[view], sub_size=10, sub_fg="on_accent", glow=True,
+                        dots=(len(FOOTBALL_VIEWS), FOOTBALL_VIEWS.index(view)),
+                        daemon="football:next-view")
+        trailing = self.mode_group() if embedded else \
+            [spec("", None, fill="sunken", fg="muted", size=24,
+                  daemon="page:football")]
+        budget = max(1, int(self.config["settings"]["slots"]) - 1
+                     - sum(max(1, int(t.get("stretch", 1) or 1)) for t in trailing))
+        with pl.lock:
+            live = pl.live()
+            upcoming = pl.upcoming(40)
+            recent = pl.recent(6)
+            table = list(pl.table)
+            club_next, club_last = pl.club_next(), pl.club_last()
+            club_row, form = pl.club_row(), pl.club_form()
+        rows = []
+        if not pl.events and not table:
+            rows = [spec("", None, fill="sunken", fg="muted", size=24,
+                         sub="connecting…" if not pl.error else "offline",
+                         sub_size=11, stretch=budget)]
+        elif view == "live":
+            # Live matches first; when nothing is on, today's slate and the
+            # next kick-offs so the page is never a blank pitch.
+            items = live + [m for m in upcoming if m not in live]
+            if not live:
+                items = recent[:2] + items
+            shown, _ = self.football_pages(items, budget // 2)
+            rows = [self.match_tile(m) for m in shown]
+        elif view == "table":
+            shown, _ = self.football_pages(table, budget)
+            rows = [self.table_tile(r) for r in shown]
+        elif view == "fixtures":
+            shown, _ = self.football_pages(upcoming, budget // 2)
+            rows = [self.match_tile(m) for m in shown]
+        else:
+            if club_row is None:
+                rows = [spec("", None, fill="sunken", fg="muted", size=24,
+                             sub="pick a club in settings", sub_size=11,
+                             stretch=budget)]
+            else:
+                rank = club_row["rank"]
+                rows = [
+                    spec("#%d" % rank, None, fill="sunken", fg="fg", size=22,
+                         gloss=False, ring=max(0.0, 1 - (rank - 1) / 19.0),
+                         bar="green" if rank <= 4 else "red" if rank >= 18 else "accent",
+                         ring_glyph=club_row["abbr"][:3], ring_glyph_fg="fg",
+                         sub="of 20", sub_size=11, sub_fg="muted",
+                         daemon="football:view"),
+                    spec(str(club_row["pts"]), None, fill="sunken", fg="accent",
+                         size=24, gloss=False, sub="pts · %d played" % club_row["played"],
+                         sub_size=11, sub_fg="muted", daemon="football:view"),
+                    spec("%d-%d-%d" % (club_row["won"], club_row["drawn"],
+                                       club_row["lost"]), None, fill="sunken",
+                         fg="fg", size=20, gloss=False, sub="w · d · l", sub_size=11,
+                         sub_fg="muted", daemon="football:view"),
+                    spec("%+d" % club_row["gd"], None, fill="sunken",
+                         fg="green" if club_row["gd"] >= 0 else "red", size=22,
+                         gloss=False, sub="%d for · %d against" % (club_row["gf"],
+                                                                   club_row["ga"]),
+                         sub_size=11, sub_fg="muted", daemon="football:view"),
+                    spec("", None, fill="sunken", fg="fg", gloss=False, form=form,
+                         sub="form" if form else "no results yet", sub_size=11,
+                         sub_fg="muted", daemon="football:view"),
+                ]
+                if club_next:
+                    rows.append(self.match_tile(club_next))
+                if club_last:
+                    rows.append(self.match_tile(club_last))
+                self.football_capacity = 0
+        return self.compose([[selector], rows], trailing)
+
+    def football_step(self, direction):
+        """Swipe paging inside the football views."""
+        capacity = self.football_capacity
+        if capacity <= 0:
+            return False
+        view = self.football_view
+        before = self.football_offset.get(view, 0)
+        last = ((max(1, self.football_total) - 1) // capacity) * capacity
+        offset = before + capacity if direction == "left" else before - capacity
+        self.football_offset[view] = max(0, min(last, offset))
+        if self.football_offset[view] != before:
+            self.prev_specs = []
+            self.render(allow_animation=False)
+            return True
+        return False
+
     # -- pages ------------------------------------------------------------
     def compose(self, groups, trailing):
         """Always the same number of buttons, whatever is on the bar."""
@@ -2493,7 +3087,7 @@ class TouchBar:
             self.page = self.fn_overlay_return or "auto"
             self.fn_overlay_return = None
         else:
-            self.fn_overlay_return = self.page if self.page in PAGES else "auto"
+            self.fn_overlay_return = self.page if self.page in self.pages() else "auto"
             self.page = "settings"
         self.prev_specs = []
         self.render(allow_animation=False)
@@ -2504,6 +3098,8 @@ class TouchBar:
         profile = self.profile_for(active_win)
         if profile.get("name") == "Browser":
             return self.page_browser(profile, active_win)
+        if profile.get("football") and self.config["settings"].get("football", True):
+            return self.page_football(embedded=True)
         trailing = self.voice_group() + self.mode_group()
         budget = max(1, int(self.config["settings"]["slots"]) - len(trailing))
         ws_row = self.workspace_group(
@@ -2799,6 +3395,8 @@ class TouchBar:
                 for left, _width in metrics]
 
     def enqueue_goal(self, payload):
+        if not self.config["settings"].get("goal_celebrations", True):
+            return
         with self.lock:
             identity = payload.get("id")
             if identity and (identity == (self.goal_active or {}).get("id") or
@@ -2852,8 +3450,11 @@ class TouchBar:
 
     def specs(self):
         self.browser_active = False
+        self.football_active = False
         if self.voice_state != "idle":
             return self.voice_overlay()
+        if self.page == "football":
+            return self.page_football()
         if self.page == "fn":
             return self.page_fn()
         if self.page == "apps":
@@ -2927,6 +3528,9 @@ class TouchBar:
         # than the tile to show at all.
         if item.get("ring") is not None and not item.get("track"):
             painted["track"] = mix(painted["fill"], "#ffffff", 0.16)
+        if item.get("form"):
+            painted["form_colors"] = tuple(self.palette.color(c) for c in
+                                           ("green", "yellow", "red"))
         return painted
 
     @staticmethod
@@ -3040,11 +3644,11 @@ class TouchBar:
         if verb == "page":
             target = args[0] if args else "next"
             if target == "next":
-                base = self.page if self.page in PAGES else "auto"
-                self.page = PAGES[(PAGES.index(base) + 1) % len(PAGES)]
+                base = self.page if self.page in self.pages() else "auto"
+                self.page = self.pages()[(self.pages().index(base) + 1) % len(self.pages())]
             elif target in ("workspaces", "claude", "chatgpt", "models", "efforts"):
                 self.page = "auto" if self.page == target else target
-            elif target in PAGES:
+            elif target in self.pages():
                 self.page = target
             self.render()
             return self.page
@@ -3071,6 +3675,15 @@ class TouchBar:
                 return "usage: goal BASE64_JSON"
             self.enqueue_goal(payload)
             return "queued"
+        if verb == "football":
+            what = args[0] if args else "refresh"
+            if what in FOOTBALL_VIEWS:
+                self.football_view = what
+                self.football_offset[what] = 0
+                self.render(allow_animation=False)
+                return what
+            self.football.fetched = 0.0        # the watcher refetches at once
+            return "refreshing"
         if verb == "render":
             self.last_written = None
             self.prev_specs = []
@@ -3095,6 +3708,11 @@ class TouchBar:
                                            "tool": self.claude.tool,
                                            "context": self.claude.context}
                                           if self.claude else None),
+                               "football": {"team": self.football.team_abbr,
+                                            "view": self.football_view,
+                                            "live": len(self.football.live()),
+                                            "matches": len(self.football.events),
+                                            "error": self.football.error},
                                "last_touch": self.last_touch,
                                "goal_active": self.goal_active,
                                "goal_queue": len(self.goal_queue)})
@@ -3149,6 +3767,8 @@ class TouchBar:
 
     def handle_swipe(self, direction):
         """Page the live tab strip while leaving the focused tab untouched."""
+        if self.football_active:
+            return self.football_step(direction)
         if not self.browser_active or self.browser_capacity <= 0:
             return False
         last_page = ((max(1, len(self.browser.tabs)) - 1)
@@ -3183,11 +3803,11 @@ class TouchBar:
             self.render()
         elif kind == "page":
             if value == "next":
-                base = self.page if self.page in PAGES else "auto"
-                self.page = PAGES[(PAGES.index(base) + 1) % len(PAGES)]
+                base = self.page if self.page in self.pages() else "auto"
+                self.page = self.pages()[(self.pages().index(base) + 1) % len(self.pages())]
             elif value in ("workspaces", "claude", "chatgpt", "models", "efforts"):
                 self.page = "auto" if self.page == value else value
-            elif value in PAGES:
+            elif value in self.pages():
                 self.page = value
             self.prev_specs = []  # no decorative transition on navigation UI
             self.render()
@@ -3216,6 +3836,15 @@ class TouchBar:
             self.render()
         elif kind == "sys" and value:
             self.system_control(value)
+        elif kind == "football":
+            if value == "next-view":
+                index = FOOTBALL_VIEWS.index(self.football_view)
+                self.football_view = FOOTBALL_VIEWS[(index + 1) % len(FOOTBALL_VIEWS)]
+                self.football_offset[self.football_view] = 0
+            elif value in FOOTBALL_VIEWS:
+                self.football_view = value
+            self.prev_specs = []
+            self.render(allow_animation=False)
         elif kind == "slider":
             # Drags along the track never reach here; a tap on the glyph
             # toggles the control off and back to its previous level.
@@ -3458,6 +4087,13 @@ def preview(bar, out="/tmp/omarchy-touchbar-preview.png", what="auto"):
             for index in range(bar.voice_levels.maxlen):
                 wave = math.sin(index / 3.0) * (0.3 + 0.6 * abs(math.sin(index / 9.0)))
                 bar.voice_levels.append((-abs(wave) * 0.8, abs(wave)))
+        specs = bar.specs()
+    elif what.startswith("football"):
+        bar.page = "football"
+        view = what.partition(":")[2]
+        if view in FOOTBALL_VIEWS:
+            bar.football_view = view
+        bar.football.refresh()
         specs = bar.specs()
     elif what == "goal":
         specs = bar.goal_specs({"scorer": "M. Salah", "team": "Liverpool",
@@ -4132,6 +4768,70 @@ def restore_static():
         pass
 
 
+def read_goal_acks():
+    try:
+        with open(GOAL_ACKS) as handle:
+            return {line.strip() for line in handle if line.strip()}
+    except OSError:
+        return set()
+
+
+def watch_football(bar):
+    """Keep the Premier League data fresh and turn new goals into celebrations.
+
+    Polls every `live_refresh` seconds while a match is on, once a minute in
+    the quarter hour before a kick-off or while the football page is
+    showing, and every `idle_refresh` otherwise. Data is fetched here, never
+    on the render path.
+    """
+    pl = bar.football
+    shown_at = 0.0
+    while True:
+        if not pl.enabled:
+            time.sleep(5)
+            continue
+        visible = bar.football_active or bar.page == "football"
+        soon = pl.next_kickoff_in()
+        if pl.any_live():
+            interval = pl.live_refresh
+        elif soon is not None and soon < 900:
+            interval = 60
+        else:
+            interval = pl.idle_refresh
+        if visible:
+            interval = min(interval, 60)
+        if not pl.fetched or time.monotonic() - pl.fetched >= interval:
+            changed = pl.refresh()
+            if pl.celebrations:
+                try:
+                    goals = pl.detect_goals(read_goal_acks())
+                except Exception as exc:                    # noqa: BLE001
+                    sys.stderr.write("omarchy-touchbar: goal detection failed: %s\n" % exc)
+                    goals = []
+                for payload in goals:
+                    bar.enqueue_goal(payload)
+                    if not shutil.which("omarchy-pl"):
+                        # The Football plugin notifies when installed; do it
+                        # ourselves only when it is not there.
+                        try:
+                            subprocess.Popen(
+                                ["omarchy-notification-send",
+                                 "GOAL · %s %s-%s %s" % (payload["homeAbbr"], payload["homeScore"],
+                                                         payload["awayScore"], payload["awayAbbr"]),
+                                 "%s · %s" % (payload["scorer"], payload["clock"])],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except OSError:
+                            pass
+            if changed and visible:
+                bar.prev_specs = []
+                bar.render(allow_animation=False)
+                shown_at = time.monotonic()
+        if visible and time.monotonic() - shown_at >= 60:
+            bar.render(allow_animation=False)       # countdown captions move
+            shown_at = time.monotonic()
+        time.sleep(1.0)
+
+
 def watch_goals(bar):
     """Replay every unacknowledged goal; never remove before it is displayed."""
     while True:
@@ -4183,6 +4883,7 @@ def run_daemon():
     threading.Thread(target=watch_system, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_browser, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_goals, args=(bar,), daemon=True).start()
+    threading.Thread(target=watch_football, args=(bar,), daemon=True).start()
     threading.Thread(target=serve, args=(bar,), daemon=True).start()
     bar.render()
     watch_hyprland(bar)
@@ -4207,6 +4908,8 @@ def main():
     if args[0] == "daemon":
         run_daemon()
         return 0
+    if args[0] == "settings":
+        os.execvp("omarchy-touchbar-settings", ["omarchy-touchbar-settings"])
     if args[0] == "preview":
         what = args[1] if len(args) > 1 else "auto"
         out = args[2] if len(args) > 2 else "/tmp/omarchy-touchbar-preview.png"

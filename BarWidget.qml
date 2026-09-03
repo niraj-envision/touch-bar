@@ -119,6 +119,11 @@ BarWidget {
   Process { id: commandProc; onExited: function() { root.refresh() } }
 
   Process {
+    id: settingsProc
+    command: ["/usr/bin/setsid", "uwsm-app", "--", "omarchy-touchbar-settings"]
+  }
+
+  Process {
     id: starter
     command: ["systemctl", "--user", "start", "omarchy-touchbar.service"]
     onExited: function() { root.refresh() }
@@ -148,6 +153,7 @@ BarWidget {
     function next(): void { root.send(["page", "next"]) }
     function page(name: string): void { root.send(["page", name]) }
     function dictate(): void { root.send(["voice", "toggle"]) }
+    function settings(): void { settingsProc.running = true }
     function status(): string { return root.label }
   }
 

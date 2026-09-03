@@ -12,6 +12,8 @@ rm -f "$user_systemd/omarchy-touchbar.service"
 systemctl --user daemon-reload
 
 rm -f "$user_bin/omarchy-touchbar" "$user_bin/omarchy-chatgpt-dictate" \
+  "$user_bin/omarchy-touchbar-settings" \
+  "${HOME}/.local/share/applications/omarchy-touchbar-settings.desktop" \
   "$omarchy_config/hooks/theme-set.d/touchbar" \
   "$omarchy_config/touchbar.toml.dist"
 

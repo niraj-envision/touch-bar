@@ -29,9 +29,17 @@ full-height, themed interface that follows the focused app.
   fans, disk and uptime, refreshed while it is open.
 - **Themed clock and battery tiles** (optional) that follow the Omarchy theme
   instead of tiny-dfr's plain white text.
-- **Premier League goal celebrations**: the whole bar becomes a stadium scene
-  with a ball-to-net flight, scorer, clock and score, delivered from the
-  [Football](https://github.com/niraj-envision/football) plugin.
+- **Built-in Premier League centre.** A football page with live scores, the
+  table, upcoming fixtures and your club's form, and a full-bar goal
+  celebration (ball-to-net flight, scorer, clock and score) whenever a goal
+  goes in. No companion app needed; if the
+  [Football](https://github.com/niraj-envision/football) plugin is installed
+  the two share one cache and one goal queue, and its terminal scorecard
+  turns the bar into the live centre while it is focused.
+- **Desktop settings.** `omarchy-touchbar-settings` (in the app launcher as
+  "Touch Bar") edits the look, feature switches, per-app profiles and their
+  buttons, and the football options, with a live preview of every page.
+  Edits keep your config file's comments and apply on save.
 - **Omarchy bar widget.** A pill in the shell bar shows what the Touch Bar is
   doing (page, dictation, Claude's tool, playing track), cycles pages on
   click, opens the controls on right click and toggles dictation on middle
@@ -47,6 +55,7 @@ full-height, themed interface that follows the focused app.
 - `tiny-dfr`
 - Python 3.11 or newer
 - `wtype`, `librsvg` (`rsvg-convert`), `brightnessctl`, `wpctl`
+- GTK 4 and libadwaita with Python bindings (`python-gobject`) for the settings app
 - [Voxtype](https://github.com/omarchy/omarchy) for Touch-Bar-only dictation
 
 ## Install
@@ -84,11 +93,14 @@ user-level parts.
 ```bash
 omarchy-touchbar status                 # JSON: page, dictation, media, Claude, last touch
 omarchy-touchbar render                 # repaint once
-omarchy-touchbar page next              # auto -> apps -> system -> settings -> fn
-omarchy-touchbar page auto|apps|system|settings|fn|workspaces
+omarchy-touchbar page next              # auto -> apps -> system -> football -> settings -> fn
+omarchy-touchbar page auto|apps|system|football|settings|fn|workspaces
 omarchy-touchbar voice toggle           # start/stop Touch-Bar dictation
+omarchy-touchbar football table         # jump to a football view, or `refresh`
+omarchy-touchbar settings               # open the settings window
 omarchy-touchbar preview                # PNG mock-up of the smart bar
 omarchy-touchbar preview system         # ...or any page, plus:
+omarchy-touchbar preview football:table [out.png]   # any football view
 omarchy-touchbar preview recording|review|goal [out.png]
 ```
 
@@ -112,17 +124,53 @@ couple of seconds while open. Setting `battery = "percentage"` or
 `clock = "%H:%M"` adds themed tiles next to the mode button; tapping either
 opens the system page.
 
-## Football goal celebrations
+## Football
 
-When the [Football](https://github.com/niraj-envision/football) plugin observes
-a new Premier League goal, the controller temporarily uses all 13 stable Touch
-Bar cells as one continuous stadium scene. The ball flies into the net, then
-the scorer and exact score remain visible for a total of five seconds.
+The **football** page is on the mode-button cycle (and opens by itself while
+the Football plugin's scorecard is focused). Its first tile cycles four
+views; swipe left or right to page through longer lists:
 
-Delivery is durable and serial: the football app records goals on disk, this
-daemon acknowledges each one only after it has finished displaying, and goals
-that arrive together are shown FIFO without overlap. Restarting the daemon may
-replay an interrupted alert, but it cannot silently lose it.
+| View | Shows |
+|---|---|
+| live | every match in progress with clock and score; otherwise the latest results and next kick-offs |
+| table | the 20 clubs with points and goal difference, Champions League and relegation places coloured, your club highlighted |
+| fixtures | upcoming matches with local kick-off time and a countdown |
+| club | league position ring, points, W-D-L, goals, last five results as form dots, next match and last result |
+
+Every match tile carries both clubs' colours on its flanks. Data comes from
+the public ESPN scoreboard and standings feeds (no key), polled every 25 s
+while a match is on, once a minute around kick-off or while the page is
+showing, and every five minutes otherwise. Pick your club under
+`[football]` in the config or in the settings app; with nothing set, the
+Football plugin's choice is used.
+
+### Goal celebrations
+
+When a new Premier League goal is observed, the bar temporarily uses all 13
+stable cells as one continuous stadium scene. The ball flies into the net,
+then the scorer and exact score remain visible for a total of five seconds.
+
+Detection is built in and baselines silently on first run, so a restart never
+replays an afternoon of goals. Goals are also accepted from the Football
+plugin's inbox; both sources use the same goal ids and one acknowledgement
+file, so a goal is shown exactly once whichever noticed it first. Delivery is
+serial and durable: goals that arrive together are shown FIFO without
+overlap, and an interrupted alert is replayed rather than lost.
+
+## Settings app
+
+```bash
+omarchy-touchbar settings          # or launch "Touch Bar" from the app menu
+omarchy-touchbar-settings apps     # open straight to a tab
+```
+
+Tabs: **Bar** (fonts, radius, animation, brightness, clock, battery, layout),
+**Features** (dictation, media, Claude, ChatGPT, browser tabs, football,
+celebrations), **Apps** (enable or disable each profile, edit its match
+pattern, icon and shortcut buttons), **Football** (club, refresh rates) and
+**Preview** (render any page as the panel draws it). Changes are written back
+into `~/.config/omarchy/touchbar.toml` in place, comments included, and the
+daemon repaints on save.
 
 ## Claude Code
 

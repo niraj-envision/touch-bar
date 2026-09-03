@@ -30,6 +30,10 @@ fi
 install -d "$user_bin" "$omarchy_config" "$omarchy_config/hooks/theme-set.d" "$hypr_config" "$user_systemd"
 install -m 0755 "$project_dir/src/omarchy-touchbar" "$user_bin/omarchy-touchbar"
 install -m 0755 "$project_dir/src/omarchy-chatgpt-dictate" "$user_bin/omarchy-chatgpt-dictate"
+install -m 0755 "$project_dir/src/omarchy-touchbar-settings" "$user_bin/omarchy-touchbar-settings"
+install -d "${HOME}/.local/share/applications"
+install -m 0644 "$project_dir/integration/omarchy-touchbar-settings.desktop" \
+  "${HOME}/.local/share/applications/omarchy-touchbar-settings.desktop"
 install -m 0755 "$project_dir/integration/theme-set-touchbar" \
   "$omarchy_config/hooks/theme-set.d/touchbar"
 install -m 0644 "$project_dir/integration/omarchy-touchbar.service" \
@@ -94,7 +98,8 @@ if [[ ! -e $panel_reset ]] \
   sudo systemctl enable touchbar-panel-reset.service
 fi
 
-python3 -m py_compile "$user_bin/omarchy-touchbar" "$user_bin/omarchy-chatgpt-dictate"
+python3 -m py_compile "$user_bin/omarchy-touchbar" "$user_bin/omarchy-chatgpt-dictate" \
+  "$user_bin/omarchy-touchbar-settings"
 python3 -c 'import tomllib, pathlib; tomllib.loads(pathlib.Path.home().joinpath(".config/omarchy/touchbar.toml").read_text())'
 
 systemctl --user stop omarchy-touchbar.service 2>/dev/null || true
