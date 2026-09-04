@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.niraj-envision.touch-bar",
   "name": "Touch Bar",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "author": "niraj-envision",
   "license": "MIT",
-  "description": "Context-aware, themed Touch Bar for T2 MacBooks: app shortcuts, live browser tabs, Claude Code telemetry, dictation, sliders, media and system vitals.",
+  "description": "Context-aware, themed Touch Bar for T2 MacBooks: app shortcuts, live browser tabs, Codex and Claude usage telemetry, dictation, sliders, media and system vitals.",
   "homepage": "https://github.com/niraj-envision/touch-bar",
   "kinds": ["bar-widget"],
   "entryPoints": {

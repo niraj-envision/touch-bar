@@ -66,6 +66,18 @@ _HYPR_STATE_LOCK = threading.Lock()
 _WTYPE_ERROR = None
 _WTYPE_STATE_LOCK = threading.Lock()
 
+# Runtime helpers are intentionally absolute. User services and shell widgets
+# do not inherit the same PATH as an interactive terminal, and a writable PATH
+# entry must never decide which executable handles a touch.
+WTYPE_BIN = "/usr/bin/wtype"
+WPCTL_BIN = "/usr/bin/wpctl"
+BUSCTL_BIN = "/usr/bin/busctl"
+BRIGHTNESSCTL_BIN = "/usr/bin/brightnessctl"
+VOXTYPE_BIN = "/usr/bin/voxtype"
+RSVG_CONVERT_BIN = "/usr/bin/rsvg-convert"
+OMARCHY_NOTIFY_BIN = "/usr/share/omarchy/bin/omarchy-notification-send"
+OMARCHY_PL_BIN = os.path.join(HOME, ".local", "bin", "omarchy-pl")
+
 PAGES = ("auto", "apps", "system", "football", "settings", "fn")
 
 # The panel is 2170x60. tiny-dfr splits it into equal cells separated by
@@ -719,7 +731,7 @@ def run_wtype(args):
     else:
         try:
             result = subprocess.run(
-                ["wtype"] + list(args), env=env, stdout=subprocess.DEVNULL,
+                [WTYPE_BIN] + list(args), env=env, stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE, text=True, timeout=3, check=False)
             problem = "" if result.returncode == 0 else (
                 (result.stderr or "wtype exited %d" % result.returncode).strip()[:512])
@@ -826,7 +838,7 @@ class MediaState:
         if now - self.checked < interval:
             return
         self.checked = now
-        names = [n for n in run_quiet(["busctl", "--user", "list", "--no-pager"]).split()
+        names = [n for n in run_quiet([BUSCTL_BIN, "--user", "list", "--no-pager"]).split()
                  if n.startswith("org.mpris.MediaPlayer2.")]
         chosen, status = "", "Stopped"
         for name in names:
@@ -838,21 +850,22 @@ class MediaState:
                 chosen, status = name, state
         self.player, self.status = chosen, status
         if chosen:                    # mute only matters while transport shows
-            volume = run_quiet(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
+            volume = run_quiet(
+                [WPCTL_BIN, "get-volume", "@DEFAULT_AUDIO_SINK@"]).strip()
             self.muted = "MUTED" in volume
             self.title = self._title(chosen)
         else:
             self.title = ""
 
     def _property(self, name, prop):
-        out = run_quiet(["busctl", "--user", "get-property", name, MPRIS_PATH,
+        out = run_quiet([BUSCTL_BIN, "--user", "get-property", name, MPRIS_PATH,
                          MPRIS_PLAYER, prop])
         parts = out.strip().split('"')
         return parts[1] if len(parts) > 1 else ""
 
     def _title(self, name):
         """'Title — Artist' from the MPRIS metadata dictionary."""
-        out = run_quiet(["busctl", "--user", "get-property", name, MPRIS_PATH,
+        out = run_quiet([BUSCTL_BIN, "--user", "get-property", name, MPRIS_PATH,
                          MPRIS_PLAYER, "Metadata"])
         title = re.search(r'"xesam:title" s "((?:[^"\\]|\\.)*)"', out)
         artist = re.search(r'"xesam:artist" as \d+ "((?:[^"\\]|\\.)*)"', out)
@@ -869,11 +882,11 @@ class MediaState:
 
     def call(self, method):
         if self.player:
-            run_quiet(["busctl", "--user", "call", self.player, MPRIS_PATH,
+            run_quiet([BUSCTL_BIN, "--user", "call", self.player, MPRIS_PATH,
                        MPRIS_PLAYER, method])
 
     def toggle_mute(self):
-        run_quiet(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+        run_quiet([WPCTL_BIN, "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
         self.checked = 0.0
 
 
@@ -1045,7 +1058,7 @@ class SystemStats:
         if self.kbd:
             self.last_kbd = self.kbd
         try:
-            out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+            out = subprocess.run([WPCTL_BIN, "get-volume", "@DEFAULT_AUDIO_SINK@"],
                                  capture_output=True, text=True, timeout=2).stdout
             match = re.search(r"([\d.]+)", out)
             self.volume = (int(round(float(match.group(1)) * 100)),
@@ -3994,31 +4007,31 @@ class TouchBar:
         if value == "bright-toggle" and screen:
             if stats.brightness:
                 stats.last_screen = stats.brightness
-                command = ["brightnessctl", "-d", screen, "s", "0%"]
+                command = [BRIGHTNESSCTL_BIN, "-d", screen, "s", "0%"]
             else:
-                command = ["brightnessctl", "-d", screen, "s",
+                command = [BRIGHTNESSCTL_BIN, "-d", screen, "s",
                            "%d%%" % max(5, stats.last_screen)]
         elif value == "kbd-toggle" and kbd:
             if stats.kbd:
                 stats.last_kbd = stats.kbd
-                command = ["brightnessctl", "-d", kbd, "s", "0%"]
+                command = [BRIGHTNESSCTL_BIN, "-d", kbd, "s", "0%"]
             else:
-                command = ["brightnessctl", "-d", kbd, "s",
+                command = [BRIGHTNESSCTL_BIN, "-d", kbd, "s",
                            "%d%%" % max(1, stats.last_kbd)]
         else:
             command = None
         commands = {
             # --min-value keeps a stray tap from turning the screen fully off.
-            "bright-": ["brightnessctl", "--min-value=5", "-d", screen,
+            "bright-": [BRIGHTNESSCTL_BIN, "--min-value=5", "-d", screen,
                         "s", "10%-"] if screen else None,
-            "bright+": ["brightnessctl", "-d", screen, "s", "10%+"]
+            "bright+": [BRIGHTNESSCTL_BIN, "-d", screen, "s", "10%+"]
                        if screen else None,
-            "kbd-": ["brightnessctl", "-d", kbd, "s", "10%-"] if kbd else None,
-            "kbd+": ["brightnessctl", "-d", kbd, "s", "10%+"] if kbd else None,
-            "vol-": ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"],
-            "vol+": ["wpctl", "set-volume", "-l", "1.0",
+            "kbd-": [BRIGHTNESSCTL_BIN, "-d", kbd, "s", "10%-"] if kbd else None,
+            "kbd+": [BRIGHTNESSCTL_BIN, "-d", kbd, "s", "10%+"] if kbd else None,
+            "vol-": [WPCTL_BIN, "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"],
+            "vol+": [WPCTL_BIN, "set-volume", "-l", "1.0",
                      "@DEFAULT_AUDIO_SINK@", "5%+"],
-            "mute": ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
+            "mute": [WPCTL_BIN, "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
         }
         args = command or commands.get(value)
         if not args:
@@ -4094,13 +4107,13 @@ class TouchBar:
         stats = self.stats
         level = max(0, min(100, int(level)))
         if kind == "bright" and stats.backlight_device:
-            args = ["brightnessctl", "-d", stats.backlight_device, "s", "%d%%" % level]
+            args = [BRIGHTNESSCTL_BIN, "-d", stats.backlight_device, "s", "%d%%" % level]
             stats.brightness = level
         elif kind == "kbd" and stats.kbd_device:
-            args = ["brightnessctl", "-d", stats.kbd_device, "s", "%d%%" % level]
+            args = [BRIGHTNESSCTL_BIN, "-d", stats.kbd_device, "s", "%d%%" % level]
             stats.kbd = level
         elif kind == "vol":
-            args = ["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@",
+            args = [WPCTL_BIN, "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@",
                     "%.2f" % (level / 100.0)]
             stats.volume = (level, bool(stats.volume and stats.volume[1]))
         else:
@@ -4137,7 +4150,7 @@ class TouchBar:
             self.voice_target = address
             self.review_until = 0.0
             self.reset_voice_meter()
-            subprocess.Popen(["voxtype", "record", "start"],
+            subprocess.Popen([VOXTYPE_BIN, "record", "start"],
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
             self.voice_state = "recording"
@@ -4145,7 +4158,7 @@ class TouchBar:
             return
 
         if self.voice_state == "recording":
-            subprocess.Popen(["voxtype", "record", "stop"],
+            subprocess.Popen([VOXTYPE_BIN, "record", "stop"],
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
             self.voice_state = "transcribing"
@@ -4163,7 +4176,7 @@ class TouchBar:
             return
         if action in ("delete", "clear", "cancel"):
             if self.voice_state in ("recording", "transcribing"):
-                subprocess.Popen(["voxtype", "record", "cancel"],
+                subprocess.Popen([VOXTYPE_BIN, "record", "cancel"],
                                  stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
                 self.voice_state = "idle"
@@ -4251,7 +4264,7 @@ def preview(bar, out="/tmp/omarchy-touchbar-preview.png", what="auto"):
     source = out + ".svg"
     with open(source, "w") as handle:
         handle.write(svg)
-    subprocess.run(["rsvg-convert", "-o", out, source], check=True)
+    subprocess.run([RSVG_CONVERT_BIN, "-o", out, source], check=True)
     return out
 
 
@@ -4637,6 +4650,82 @@ def watch_voice_levels(bar):
 
 
 CODEX_SESSION_CACHE = {}
+CODEX_SESSION_MAX_BYTES = 128 * 1024 * 1024
+
+
+def codex_payload(line):
+    """Return only a dictionary payload from one rollout record."""
+    try:
+        item = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(item, dict):
+        return {}
+    payload = item.get("payload") or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def codex_count(value, maximum=10**12):
+    """Bound counters before they reach layout and formatting code."""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, min(maximum, number))
+
+
+def codex_percent(value):
+    """Convert a usage percentage to a finite 0..100 integer."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return max(0, min(100, int(round(number))))
+
+
+def open_codex_session(path):
+    """Open one rollout without following attacker-controlled path leaves.
+
+    Codex owns these files, but the Touch Bar daemon is long-lived and should
+    still fail closed if anything under the session tree is replaced with a
+    symlink, FIFO, device, or unexpectedly large/writable file.
+    """
+    root = os.path.join(HOME, ".codex", "sessions")
+    relative = os.path.relpath(path, root)
+    parts = relative.split(os.sep)
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep) \
+            or not parts or any(part in ("", ".", os.pardir) for part in parts):
+        raise OSError("Codex rollout is outside the session directory")
+
+    directory_flags = (os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC |
+                       os.O_NOFOLLOW | os.O_NONBLOCK)
+    leaf_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    directory_fd = os.open(root, directory_flags)
+    try:
+        for component in parts[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        fd = os.open(parts[-1], leaf_flags, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("Codex rollout is not a regular file")
+        if metadata.st_uid != os.getuid() or metadata.st_nlink != 1:
+            raise OSError("Codex rollout ownership/link check failed")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise OSError("Codex rollout is writable by another user")
+        if metadata.st_size > CODEX_SESSION_MAX_BYTES:
+            raise OSError("Codex rollout exceeds the read limit")
+        return os.fdopen(fd, "rb")
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def codex_session_summary(path):
@@ -4647,11 +4736,10 @@ def codex_session_summary(path):
     summary = {"model": "", "effort": "", "turns": 0,
                "active_started": 0.0}
     try:
-        with open(path, errors="replace") as handle:
-            for line in handle:
-                try:
-                    payload = json.loads(line).get("payload") or {}
-                except json.JSONDecodeError:
+        with open_codex_session(path) as handle:
+            for encoded_line in handle:
+                payload = codex_payload(encoded_line.decode(errors="replace"))
+                if not payload:
                     continue
                 event_type = payload.get("type")
                 if event_type == "task_started":
@@ -4662,9 +4750,12 @@ def codex_session_summary(path):
                     summary["active_started"] = 0.0
                 elif event_type == "thread_settings_applied":
                     settings = payload.get("thread_settings") or {}
-                    summary["model"] = settings.get("model") or summary["model"]
-                    summary["effort"] = (settings.get("reasoning_effort") or
-                                         summary["effort"])
+                    if isinstance(settings, dict):
+                        summary["model"] = str(
+                            settings.get("model") or summary["model"])[:64]
+                        summary["effort"] = str(
+                            settings.get("reasoning_effort") or
+                            summary["effort"])[:32]
     except OSError:
         pass
     CODEX_SESSION_CACHE[path] = (time.monotonic(), summary)
@@ -4697,23 +4788,25 @@ def latest_codex_state():
     rate = {"usage": None, "secondary_usage": None, "mtime": -1}
     for mtime, path in stamped[:16]:
         try:
-            with open(path, "rb") as handle:
+            with open_codex_session(path) as handle:
                 # Ignore guardian/reviewer/subagent rollouts. Their tiny,
                 # short-lived model names made the desktop panel jump away
                 # from the user's actual ChatGPT/Codex task.
                 prefix = handle.read(32768).decode(errors="replace")
                 metadata = {}
                 for line in prefix.splitlines():
-                    try:
-                        candidate = json.loads(line).get("payload") or {}
-                    except json.JSONDecodeError:
-                        continue
+                    candidate = codex_payload(line)
                     if candidate.get("session_id"):
                         metadata = candidate
                         break
+                if not metadata:
+                    continue
                 source = metadata.get("source")
-                if metadata.get("parent_thread_id") or \
-                        metadata.get("thread_source") or isinstance(source, dict):
+                # Current Codex desktop root tasks identify themselves with
+                # thread_source="user". Only concrete child provenance is a
+                # reason to reject a rollout; the old generic thread_source
+                # check hid every current root task and blanked both gauges.
+                if metadata.get("parent_thread_id") or isinstance(source, dict):
                     continue
                 handle.seek(0, os.SEEK_END)
                 end = handle.tell()
@@ -4734,11 +4827,9 @@ def latest_codex_state():
         line_number = -1
         file_rate = {"usage": None, "secondary_usage": None}
         for line_number, line in enumerate(raw.splitlines()):
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
+            payload = codex_payload(line)
+            if not payload:
                 continue
-            payload = item.get("payload") or {}
             event_type = payload.get("type")
             if event_type in ("task_started", "task_complete", "turn_aborted"):
                 events.append(event_type)
@@ -4749,27 +4840,41 @@ def latest_codex_state():
                     started_at = 0.0
             if event_type == "thread_settings_applied":
                 settings = payload.get("thread_settings") or {}
-                detail["model"] = settings.get("model") or detail["model"]
-                detail["effort"] = (settings.get("reasoning_effort") or
-                                    detail["effort"])
+                if isinstance(settings, dict):
+                    detail["model"] = str(
+                        settings.get("model") or detail["model"])[:64]
+                    detail["effort"] = str(
+                        settings.get("reasoning_effort") or
+                        detail["effort"])[:32]
             if event_type in ("function_call", "custom_tool_call"):
                 detail["tools"] += 1
-                detail["tool"] = (payload.get("name") or "tool").split("__")[-1]
+                detail["tool"] = str(
+                    payload.get("name") or "tool").split("__")[-1][:64]
             if event_type == "token_count":
                 info = payload.get("info") or {}
+                if not isinstance(info, dict):
+                    continue
                 last = info.get("last_token_usage") or {}
                 total = info.get("total_token_usage") or {}
-                detail["context"] = int(last.get("total_tokens") or 0)
-                detail["context_limit"] = int(info.get("model_context_window") or 0)
-                detail["output"] = int(total.get("output_tokens") or 0)
+                last = last if isinstance(last, dict) else {}
+                total = total if isinstance(total, dict) else {}
+                detail["context"] = codex_count(last.get("total_tokens"))
+                detail["context_limit"] = codex_count(
+                    info.get("model_context_window"))
+                detail["output"] = codex_count(total.get("output_tokens"))
                 limits = payload.get("rate_limits") or {}
+                limits = limits if isinstance(limits, dict) else {}
                 primary = limits.get("primary") or {}
                 secondary = limits.get("secondary") or {}
-                if primary.get("used_percent") is not None:
-                    file_rate["usage"] = int(round(primary["used_percent"]))
-                if secondary.get("used_percent") is not None:
-                    file_rate["secondary_usage"] = int(
-                        round(secondary["used_percent"]))
+                primary = primary if isinstance(primary, dict) else {}
+                secondary = secondary if isinstance(secondary, dict) else {}
+                primary_percent = codex_percent(primary.get("used_percent"))
+                secondary_percent = codex_percent(
+                    secondary.get("used_percent"))
+                if primary_percent is not None:
+                    file_rate["usage"] = primary_percent
+                if secondary_percent is not None:
+                    file_rate["secondary_usage"] = secondary_percent
         file_active = bool(events) and events[-1] == "task_started"
         # A single tool-heavy turn can push task_started outside the 256 KiB
         # tail. Fresh reasoning/tool events after the last boundary still mean
@@ -4933,12 +5038,12 @@ def watch_football(bar):
                     goals = []
                 for payload in goals:
                     bar.enqueue_goal(payload)
-                    if not shutil.which("omarchy-pl"):
+                    if not os.path.isfile(OMARCHY_PL_BIN):
                         # The Football plugin notifies when installed; do it
                         # ourselves only when it is not there.
                         try:
                             subprocess.Popen(
-                                ["omarchy-notification-send",
+                                [OMARCHY_NOTIFY_BIN,
                                  "GOAL · %s %s-%s %s" % (payload["homeAbbr"], payload["homeScore"],
                                                          payload["awayScore"], payload["awayAbbr"]),
                                  "%s · %s" % (payload["scorer"], payload["clock"])],

@@ -99,7 +99,7 @@ class WaylandLaunchPath(unittest.TestCase):
                     mock.patch.object(tb.subprocess, "run", side_effect=fake_run):
                 self.assertTrue(tb.run_wtype(["-k", "1"]))
             server.close()
-            self.assertEqual(seen["argv"], ["wtype", "-k", "1"])
+            self.assertEqual(seen["argv"], ["/usr/bin/wtype", "-k", "1"])
             self.assertEqual(seen["env"]["WAYLAND_DISPLAY"], "wayland-7")
             self.assertEqual(seen["env"]["XDG_RUNTIME_DIR"], runtime)
 

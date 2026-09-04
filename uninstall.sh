@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # Remove the Omarchy Touch Bar daemon and leave tiny-dfr with a plain F-row.
 set -euo pipefail
 
@@ -7,11 +7,11 @@ omarchy_config="${HOME}/.config/omarchy"
 hypr_config="${HOME}/.config/hypr"
 user_systemd="${HOME}/.config/systemd/user"
 
-systemctl --user disable --now omarchy-touchbar.service 2>/dev/null || true
-rm -f "$user_systemd/omarchy-touchbar.service"
-systemctl --user daemon-reload
+/usr/bin/systemctl --user disable --now omarchy-touchbar.service 2>/dev/null || true
+/usr/bin/rm -f "$user_systemd/omarchy-touchbar.service"
+/usr/bin/systemctl --user daemon-reload
 
-rm -f "$user_bin/omarchy-touchbar" "$user_bin/omarchy-chatgpt-dictate" \
+/usr/bin/rm -f "$user_bin/omarchy-touchbar" "$user_bin/omarchy-chatgpt-dictate" \
   "$user_bin/omarchy-touchbar-settings" \
   "${HOME}/.local/share/applications/omarchy-touchbar-settings.desktop" \
   "$omarchy_config/hooks/theme-set.d/touchbar" \
@@ -19,7 +19,7 @@ rm -f "$user_bin/omarchy-touchbar" "$user_bin/omarchy-chatgpt-dictate" \
 
 autostart="$hypr_config/autostart.lua"
 if [[ -f $autostart ]]; then
-  sed -i '/Context-aware T2 MacBook Touch Bar/d;/omarchy-touchbar/d' "$autostart"
+  /usr/bin/sed -i '/Context-aware T2 MacBook Touch Bar/d;/omarchy-touchbar/d' "$autostart"
 fi
 
 echo "Touch Bar daemon removed. Kept: ~/.config/omarchy/touchbar.toml and the"

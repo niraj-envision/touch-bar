@@ -259,7 +259,7 @@ def plugin_club():
 
 def daemon_active():
     try:
-        out = subprocess.run(["systemctl", "--user", "is-active", "omarchy-touchbar"],
+        out = subprocess.run(["/usr/bin/systemctl", "--user", "is-active", "omarchy-touchbar"],
                              capture_output=True, text=True, timeout=3).stdout.strip()
         return out == "active"
     except (OSError, subprocess.SubprocessError):
@@ -328,7 +328,7 @@ def main():
             self.queue_save()
 
         def restart_daemon(self):
-            subprocess.Popen(["systemctl", "--user", "restart", "omarchy-touchbar"],
+            subprocess.Popen(["/usr/bin/systemctl", "--user", "restart", "omarchy-touchbar"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.toast.add_toast(Adw.Toast(title="Touch Bar daemon restarting"))
 

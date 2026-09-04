@@ -23,6 +23,10 @@ full-height, themed interface that follows the focused app.
   turn is in flight; idle, the tile names the model and opens a picker.
   Session, weekly and model-scoped rate limits with reset countdowns,
   context ring, lifetime tokens, and a full stats page one tap away.
+- **Codex / ChatGPT usage.** The ChatGPT page follows the current desktop
+  task and shows its model, reasoning effort, context use, active time, and
+  the real short-window and weekly usage percentages from local rollout
+  metadata. It never reads message text, tool arguments, or credentials.
 - **Dictation on the bar.** Touch-Bar-only Voxtype dictation with a live
   two-sided microphone waveform, then Add / Send / Delete after transcription.
 - **Media transport** with an animated equaliser and the current track title
@@ -210,6 +214,21 @@ If no model-scoped bucket is reported, the third ring falls back to a local
 [settings]
 claude_weekly_budget = 500000000   # tokens; 0 disables the gauge
 ```
+
+## Codex / ChatGPT
+
+Open the **chatgpt** page to see the current Codex desktop task. The daemon
+reads only numeric and lifecycle fields from recent files under
+`~/.codex/sessions`: model, reasoning effort, task boundaries, token counts,
+context limit, tool names, and the two usage-window percentages. User-owned
+root tasks are shown; reviewer and subagent rollouts are excluded using their
+explicit child provenance. Message content, tool arguments, `auth.json`, and
+the network are never accessed.
+
+Session leaves are opened descriptor-first with no-follow and non-blocking
+flags, then accepted only when they are regular, user-owned, singly linked,
+not group/world-writable, and within the read limit. A malformed or planted
+special file therefore fails closed without blocking the daemon.
 
 ## Architecture
 

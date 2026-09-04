@@ -1,0 +1,21 @@
+name: Validate plugin
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - run: python3 -m py_compile src/omarchy-touchbar src/omarchy-chatgpt-dictate src/omarchy-touchbar-settings
+      - run: bash -n install.sh uninstall.sh integration/theme-set-touchbar integration/touchbar-panel-reset
+      - run: python3 -m json.tool manifest.json >/dev/null

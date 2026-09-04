@@ -37,7 +37,8 @@ class ConfigEditor(unittest.TestCase):
         self.assertEqual(data["settings"]["clock"], "%H:%M")
         self.assertFalse(data["settings"]["dictation"])
         self.assertEqual(data["settings"]["brand_new_key"], "x")
-        text = open(self.path).read()
+        with open(self.path) as handle:
+            text = handle.read()
         self.assertIn("# buttons besides the esc key", text)      # comments survive
         self.assertIn("corner_radius = 9", text)
         self.assertEqual(text.count("[settings]"), 1)

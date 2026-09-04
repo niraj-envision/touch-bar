@@ -23,8 +23,10 @@ BarWidget {
   property bool mediaPlaying: false
   property bool running: false
   property bool installed: false
+  property bool statusParsed: false
 
   readonly property string binPath: Quickshell.env("HOME") + "/.local/bin/omarchy-touchbar"
+  readonly property string settingsPath: Quickshell.env("HOME") + "/.local/bin/omarchy-touchbar-settings"
   readonly property string installPath: Qt.resolvedUrl("install.sh").toString().replace(/^file:\/\//, "")
   readonly property bool showLabel: setting("showLabel", true) !== false
   readonly property int pollInterval: Math.min(60, Math.max(1, Number(setting("pollInterval", 3)))) * 1000
@@ -63,7 +65,7 @@ BarWidget {
   implicitHeight: button.implicitHeight
 
   function refresh() {
-    if (!statusProbe.running) statusProbe.running = true
+    if (!installCheck.running && !statusProbe.running) installCheck.running = true
   }
 
   function send(args) {
@@ -78,9 +80,24 @@ BarWidget {
   }
 
   Process {
-    id: statusProbe
-    command: ["/bin/bash", "-c", "test -x \"$1\" || exit 3; \"$1\" status", "--", root.binPath]
+    id: installCheck
+    command: ["/usr/bin/test", "-x", root.binPath]
     running: true
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.installed = false
+        root.running = false
+        return
+      }
+      root.installed = true
+      root.statusParsed = false
+      if (!statusProbe.running) statusProbe.running = true
+    }
+  }
+
+  Process {
+    id: statusProbe
+    command: [root.binPath, "status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -96,6 +113,7 @@ BarWidget {
           var media = data.media || null
           root.mediaPlaying = !!(media && media.status === "Playing")
           root.mediaTitle = media ? String(media.title || "").slice(0, 80) : ""
+          root.statusParsed = true
           root.running = true
         } catch (e) {
           // Keep the previous reading on a partial line.
@@ -103,9 +121,8 @@ BarWidget {
       }
     }
     onExited: function(exitCode) {
-      if (exitCode === 3) { root.installed = false; root.running = false }
-      else if (exitCode !== 0) { root.installed = true; root.running = false }
-      else root.installed = true
+      root.installed = true
+      if (exitCode !== 0 || !root.statusParsed) root.running = false
     }
   }
 
@@ -120,21 +137,21 @@ BarWidget {
 
   Process {
     id: settingsProc
-    command: ["/usr/bin/setsid", "uwsm-app", "--", "omarchy-touchbar-settings"]
+    command: ["/usr/bin/setsid", "/usr/bin/uwsm-app", "--", root.settingsPath]
   }
 
   Process {
     id: starter
-    command: ["systemctl", "--user", "start", "omarchy-touchbar.service"]
+    command: ["/usr/bin/systemctl", "--user", "start", "omarchy-touchbar.service"]
     onExited: function() { root.refresh() }
   }
 
   Process {
     id: installerProc
     command: [
-      "/usr/bin/setsid", "uwsm-app", "--", "xdg-terminal-exec",
+      "/usr/bin/setsid", "/usr/bin/uwsm-app", "--", "/usr/bin/xdg-terminal-exec",
       "--app-id=org.omarchy.terminal", "--title=Touch Bar Setup",
-      "-e", "/bin/bash", root.installPath
+      "-e", "/usr/bin/bash", root.installPath
     ]
     onExited: function() { root.refresh() }
   }
@@ -151,7 +168,10 @@ BarWidget {
 
     function refresh(): void { root.refresh() }
     function next(): void { root.send(["page", "next"]) }
-    function page(name: string): void { root.send(["page", name]) }
+    function page(name: string): void {
+      var allowed = ["auto", "apps", "system", "football", "settings", "fn", "workspaces", "claude", "models", "efforts", "chatgpt"]
+      if (allowed.indexOf(name) !== -1) root.send(["page", name])
+    }
     function dictate(): void { root.send(["voice", "toggle"]) }
     function settings(): void { settingsProc.running = true }
     function status(): string { return root.label }

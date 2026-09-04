@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # Rebind the Touch Bar display driver after resume.
 #
 # After suspend the T2's display endpoint (USB 05ac:8302, driver appletbdrm)
@@ -16,12 +16,12 @@ shopt -s nullglob
 interfaces=("$driver"/*:*)
 [[ ${#interfaces[@]} -gt 0 ]] || exit 0
 
-systemctl stop tiny-dfr.service 2>/dev/null || true
+/usr/bin/systemctl stop tiny-dfr.service 2>/dev/null || true
 for path in "${interfaces[@]}"; do
-  iface=$(basename "$path")
+  iface=${path##*/}
   echo "$iface" > "$driver/unbind" 2>/dev/null || true
-  sleep 1
+  /usr/bin/sleep 1
   echo "$iface" > "$driver/bind" 2>/dev/null || true
 done
-systemctl start tiny-dfr.service 2>/dev/null || true
+/usr/bin/systemctl start tiny-dfr.service 2>/dev/null || true
 exit 0
