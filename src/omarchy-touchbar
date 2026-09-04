@@ -15,6 +15,7 @@ come from the current Omarchy theme.
   omarchy-touchbar render     repaint once
   omarchy-touchbar page next|auto|fn|workspaces
   omarchy-touchbar focus N    focus the window in the Nth window slot
+  omarchy-touchbar tab N      focus the Nth live browser tab
   omarchy-touchbar preview [page] [out.png]   write a PNG mock-up of a page
   omarchy-touchbar football [live|table|fixtures|club|refresh]
   omarchy-touchbar settings   open the desktop settings window
@@ -62,6 +63,8 @@ HYPR_ROOT = os.path.join(RUNTIME, "hypr")
 _HYPR_DIR_CACHE = None
 _HYPR_ERROR = None
 _HYPR_STATE_LOCK = threading.Lock()
+_WTYPE_ERROR = None
+_WTYPE_STATE_LOCK = threading.Lock()
 
 PAGES = ("auto", "apps", "system", "football", "settings", "fn")
 
@@ -352,9 +355,18 @@ class BrowserTabs:
         return mods
 
     @staticmethod
-    def find_profile():
-        roots = [os.path.join(HOME, ".config", "zen"),
-                 os.path.join(HOME, ".mozilla", "firefox")]
+    def find_profile(window_class=""):
+        family = str(window_class or "").lower()
+        if "zen" in family:
+            roots = [os.path.join(HOME, ".config", "zen")]
+        elif "librewolf" in family:
+            roots = [os.path.join(HOME, ".librewolf")]
+        elif "firefox" in family:
+            roots = [os.path.join(HOME, ".mozilla", "firefox")]
+        else:
+            roots = [os.path.join(HOME, ".config", "zen"),
+                     os.path.join(HOME, ".mozilla", "firefox"),
+                     os.path.join(HOME, ".librewolf")]
         candidates = []
         for root in roots:
             ini_path = os.path.join(root, "profiles.ini")
@@ -380,6 +392,23 @@ class BrowserTabs:
                 candidates.append((os.path.getmtime(recovery),
                                    os.path.dirname(os.path.dirname(recovery))))
         return max(candidates)[1] if candidates else None
+
+    def set_profile(self, profile):
+        if profile == self.profile:
+            return
+        self.profile = profile
+        self.recovery = os.path.join(
+            profile, "sessionstore-backups", "recovery.jsonlz4"
+        ) if profile else None
+        self.favicon_db = os.path.join(profile, "favicons.sqlite") \
+            if profile else None
+        self.stamp = None
+        self.session_cache = (None, None)
+        self.signature = None
+        self.override = None
+        self.icon_cache.clear()
+        self.icon_stamp = None
+        self.select_mods = self.load_select_chord()
 
     @staticmethod
     def current_entry(tab):
@@ -423,15 +452,22 @@ class BrowserTabs:
         if not windows:
             return None
         wanted = browser_title((active_win or {}).get("title"))
-        if wanted and wanted.lower() not in ("zen browser", "mozilla firefox", "firefox"):
+        if wanted:
+            generic = {"zen browser", "mozilla firefox", "firefox"}
             for window in windows:
                 tabs = window.get("tabs") or []
                 selected = max(0, min(len(tabs) - 1,
                                      int(window.get("selected", 1)) - 1))
                 if tabs:
                     title = browser_title(self.current_entry(tabs[selected]).get("title"))
-                    if title == wanted:
+                    if title == wanted or (
+                            wanted.lower() in generic
+                            and title.lower() in generic | {"", "new tab", "about:blank"}):
                         return window
+            # A new/restored window is absent from recovery.jsonlz4 for a few
+            # seconds. Falling through would display an older saved window and
+            # make its numeric shortcuts target the wrong tabs.
+            return None
         selected_window = max(0, int(session.get("selectedWindow", 1)) - 1)
         if selected_window < len(windows):
             return windows[selected_window]
@@ -442,19 +478,16 @@ class BrowserTabs:
         if not force and now - self.checked < 0.35:
             return False
         self.checked = now
-        if not self.recovery:
-            # The browser may simply not have been running when the daemon
-            # started; look for its profile again now and then.
-            if now - self.profile_checked < 15.0:
-                return False
+        # Re-evaluate while running so a daemon that saw an old Firefox
+        # profile first cannot keep showing it after Zen is focused, or vice
+        # versa.
+        if not self.recovery or now - self.profile_checked >= 5.0:
             self.profile_checked = now
-            self.profile = self.find_profile()
-            if not self.profile:
+            profile = self.find_profile((active_win or {}).get("class", ""))
+            if profile != self.profile:
+                self.set_profile(profile)
+            if not self.recovery:
                 return False
-            self.recovery = os.path.join(
-                self.profile, "sessionstore-backups", "recovery.jsonlz4")
-            self.favicon_db = os.path.join(self.profile, "favicons.sqlite")
-            self.select_mods = self.load_select_chord()
         try:
             info = os.stat(self.recovery)
             stamp = (info.st_mtime_ns, info.st_size)
@@ -479,7 +512,14 @@ class BrowserTabs:
             self.session_cache = (stamp, session)
         window = self.choose_window(session, active_win)
         if not window:
-            return False
+            new_signature = (0, ())
+            changed = new_signature != self.signature
+            self.tabs = []
+            self.selected = 0
+            self.file_selected = 0
+            self.signature = new_signature
+            self.stamp = composite
+            return changed
         kept, selected = self.visible_tabs(window)
         self.file_selected = selected
         if self.override:
@@ -627,6 +667,74 @@ def wtype_args(keys):
         args += ["-m", mod, "-s", "20"]
     args += ["-s", "40"]
     return args
+
+
+def wayland_environment():
+    """Return an environment that can reach this session's Wayland socket.
+
+    The persistent user service can start before Hyprland, so it cannot rely
+    on WAYLAND_DISPLAY having been imported into the systemd user manager.
+    Discover the user-owned socket at call time, as the Hyprland IPC path does.
+    """
+    names = []
+    requested = os.environ.get("WAYLAND_DISPLAY", "").strip()
+    if requested and os.path.basename(requested) == requested:
+        names.append(requested)
+    discovered = []
+    try:
+        for entry in os.scandir(RUNTIME):
+            if not re.fullmatch(r"wayland-\d+", entry.name):
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():
+                discovered.append((info.st_mtime_ns, entry.name))
+    except OSError:
+        pass
+    names.extend(name for _, name in sorted(discovered, reverse=True)
+                 if name not in names)
+    for name in names:
+        path = os.path.join(RUNTIME, name)
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():
+            env = os.environ.copy()
+            env["XDG_RUNTIME_DIR"] = RUNTIME
+            env["WAYLAND_DISPLAY"] = name
+            return env
+    return None
+
+
+def run_wtype(args):
+    """Run wtype with a discovered display and make launch failures visible."""
+    global _WTYPE_ERROR
+    env = wayland_environment()
+    if env is None:
+        problem = "no user-owned Wayland socket found beneath %s" % RUNTIME
+        result = None
+    else:
+        try:
+            result = subprocess.run(
+                ["wtype"] + list(args), env=env, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, text=True, timeout=3, check=False)
+            problem = "" if result.returncode == 0 else (
+                (result.stderr or "wtype exited %d" % result.returncode).strip()[:512])
+        except (OSError, subprocess.SubprocessError) as exc:
+            result, problem = None, str(exc)
+    with _WTYPE_STATE_LOCK:
+        previous = _WTYPE_ERROR
+        _WTYPE_ERROR = problem or None
+    if problem and problem != previous:
+        sys.stderr.write("omarchy-touchbar: virtual keyboard unavailable: %s\n" % problem)
+        sys.stderr.flush()
+    elif not problem and previous:
+        sys.stderr.write("omarchy-touchbar: virtual keyboard connected\n")
+        sys.stderr.flush()
+    return bool(result is not None and result.returncode == 0)
 
 
 PERMISSION_LABELS = {
@@ -3679,6 +3787,16 @@ class TouchBar:
                      % self.window_slots[slot], as_json=False)
                 return "ok"
             return "empty slot"
+        if verb == "tab":
+            try:
+                target = int(args[0]) - 1
+            except (IndexError, ValueError):
+                return "usage: tab N"
+            self.browser.refresh(self.active_window(0), force=True)
+            if not (0 <= target < len(self.browser.tabs)):
+                return "empty tab"
+            self.focus_browser_tab(target)
+            return "ok"
         if verb == "voice":
             action = args[0] if args else "toggle"
             self.voice_action(action)
@@ -3758,14 +3876,12 @@ class TouchBar:
             if target < 8:
                 args = wtype_args("%s+%d" % (mods, target + 1))
                 if args:
-                    subprocess.run(["wtype"] + args, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, check=False)
+                    run_wtype(args)
                 return
             if target == count - 1:
                 args = wtype_args("%s+9" % mods)
                 if args:
-                    subprocess.run(["wtype"] + args, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, check=False)
+                    run_wtype(args)
                 return
             forward = (target - current) % count
             backward = (current - target) % count
@@ -3774,8 +3890,7 @@ class TouchBar:
             args = wtype_args(chord)
             for _ in range(repeats):
                 if args:
-                    subprocess.run(["wtype"] + args, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, check=False)
+                    run_wtype(args)
                     time.sleep(0.025)
 
         threading.Thread(target=type_switch, daemon=True).start()
@@ -3829,8 +3944,7 @@ class TouchBar:
         elif kind == "keys" and value:
             args = wtype_args(value)
             if args:
-                subprocess.Popen(["wtype"] + args, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
+                threading.Thread(target=run_wtype, args=(args,), daemon=True).start()
         elif kind == "browser-tab" and value:
             try:
                 self.focus_browser_tab(int(value))
@@ -4005,13 +4119,9 @@ class TouchBar:
         because a slash command only registers at the start of an empty line.
         """
         try:
-            subprocess.run(["wtype", "-M", "ctrl", "-s", "20", "-k", "a", "-s", "20",
-                            "-m", "ctrl", "-s", "20", "-k", "BackSpace", "-s", "40"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           check=False)
-            subprocess.run(["wtype", command, "-k", "Return", "-s", "40"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           check=False)
+            run_wtype(["-M", "ctrl", "-s", "20", "-k", "a", "-s", "20",
+                       "-m", "ctrl", "-s", "20", "-k", "BackSpace", "-s", "40"])
+            run_wtype([command, "-k", "Return", "-s", "40"])
         except OSError as exc:
             sys.stderr.write("omarchy-touchbar: cannot type %r: %s\n" % (command, exc))
 
@@ -4066,9 +4176,7 @@ class TouchBar:
                 self.clear_dictation()
             return
         if action == "send" and self.voice_state == "review":
-            subprocess.run(["wtype", "-k", "Return", "-s", "40"],
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, check=False)
+            run_wtype(["-k", "Return", "-s", "40"])
             self.voice_state = "idle"
             self.voice_backend = None
             self.voice_target = None
@@ -4081,9 +4189,8 @@ class TouchBar:
             return
         # Select and clear the input. This is intentionally routed through a
         # daemon command because tiny-dfr actions are chords, not sequences.
-        subprocess.run(["wtype", "-M", "ctrl", "-s", "20", "-k", "a", "-s", "20",
-                        "-m", "ctrl", "-s", "20", "-k", "BackSpace", "-s", "40"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_wtype(["-M", "ctrl", "-s", "20", "-k", "a", "-s", "20",
+                   "-m", "ctrl", "-s", "20", "-k", "BackSpace", "-s", "40"])
         self.voice_state = "idle"
         self.render()
 

@@ -97,6 +97,7 @@ omarchy-touchbar status                 # JSON: page, dictation, media, Claude, 
 omarchy-touchbar render                 # repaint once
 omarchy-touchbar page next              # auto -> apps -> system -> football -> settings -> fn
 omarchy-touchbar page auto|apps|system|football|settings|fn|workspaces
+omarchy-touchbar tab N                       # focus the Nth live browser tab
 omarchy-touchbar voice toggle           # start/stop Touch-Bar dictation
 omarchy-touchbar football table         # jump to a football view, or `refresh`
 omarchy-touchbar settings               # open the settings window
