@@ -3119,7 +3119,7 @@ class TouchBar:
                         daemon="football:next-view")
         trailing = self.mode_group() if embedded else \
             [spec("", None, fill="sunken", fg="muted", size=24,
-                  daemon="page:football")]
+                  daemon="page:next")]
         budget = max(1, int(self.config["settings"]["slots"]) - 1
                      - sum(max(1, int(t.get("stretch", 1) or 1)) for t in trailing))
         with pl.lock:

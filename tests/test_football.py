@@ -116,6 +116,8 @@ class Football(unittest.TestCase):
         specs = bar.specs()
         self.assertEqual(sum(max(1, int(t.get("stretch", 1) or 1)) for t in specs), 13)
         self.assertEqual(specs[0]["daemon"], "football:next-view")
+        # The trailing tile must advance the mode cycle, not re-enter the page.
+        self.assertEqual(specs[-1]["daemon"], "page:next")
         self.assertEqual([t["badge"] for t in specs[1:12]], list(range(1, 12)))
         self.assertTrue(bar.football_step("left"))
         self.assertEqual(bar.specs()[1]["badge"], 12)
@@ -123,6 +125,8 @@ class Football(unittest.TestCase):
         self.assertTrue(bar.football_step("right"))
         bar.handle_touch_action("football:next-view")
         self.assertEqual(bar.football_view, "fixtures")
+        bar.handle_touch_action("page:next")
+        self.assertEqual(bar.page, "settings")
         self.assertIn("football", bar.pages())
         bar.config["settings"]["football"] = False
         self.assertNotIn("football", bar.pages())
