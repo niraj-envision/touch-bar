@@ -26,13 +26,16 @@ import calendar
 import base64
 import configparser
 from collections import deque
+import fcntl
 import hashlib
 import html
 import glob
 import json
 import math
 import os
+import queue
 import re
+import select
 import shutil
 import signal
 import socket
@@ -52,7 +55,13 @@ THEME_COLORS = os.path.join(HOME, ".local/state/omarchy/current/theme/colors.tom
 DFR_DIR = "/etc/tiny-dfr"
 DFR_CONFIG = os.path.join(DFR_DIR, "config.toml")
 GEN_DIR = os.path.join(DFR_DIR, "gen")
-RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+# T1 MacBooks (2016/2017) have no tiny-dfr: T1Bridge owns the panel and hands
+# an unprivileged renderer complete pixel frames and touch contacts over a
+# seqpacket socket. OMARCHY_TOUCHBAR_BACKEND=t1|dfr overrides the detection.
+T1_SOCKET = "/run/t1bridge/touchbar.sock"
+BACKEND = os.environ.get("OMARCHY_TOUCHBAR_BACKEND") or (
+    "t1" if os.path.exists(T1_SOCKET) and not os.path.isdir(DFR_DIR) else "dfr")
+RUNTIME =os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
 SOCK_PATH = os.path.join(RUNTIME, "omarchy-touchbar.sock")
 GOAL_INBOX = os.path.join(HOME, ".local", "state", "omarchy-pl", "touchbar-goals.jsonl")
 GOAL_ACKS = os.path.join(HOME, ".local", "state", "omarchy-pl", "touchbar-goals.acked")
@@ -231,6 +240,7 @@ def load_config():
     cfg["profiles"] = [p for p in user.get("profiles", [])
                        if isinstance(p, dict) and p.get("enabled", True) is not False]
     cfg["football"] = user.get("football", {}) if isinstance(user.get("football"), dict) else {}
+    cfg["launchers"] = user.get("launchers", {}) if isinstance(user.get("launchers"), dict) else {}
     return cfg
 
 
@@ -2299,6 +2309,8 @@ class IconCache:
     def __init__(self, clear=False, limit=600):
         self.known = {}                       # digest -> None, insertion ordered
         self.limit = limit
+        if BACKEND == "t1":                   # frames are rastered in memory
+            return
         if clear:
             try:
                 shutil.rmtree(GEN_DIR)
@@ -2748,7 +2760,9 @@ class TouchBar:
             spec(entry.get("label", "").replace("{mode}", mode), entry.get("keys"),
                  fill=entry.get("background", "surface"),
                  fg=entry.get("color", "fg"),
-                 size=entry.get("size", 26))
+                 size=entry.get("size", 26),
+                 **({"daemon": "run:%s" % entry["run"]} if entry.get("run") else
+                    {"daemon": "type:%s" % entry["text"]} if entry.get("text") else {}))
             for entry in profile.get("buttons", [])
         ]
         if profile.get("claude"):
@@ -3613,6 +3627,8 @@ class TouchBar:
 
     # -- output -----------------------------------------------------------
     def to_toml(self, specs, scale_at=None):
+        if BACKEND == "t1":
+            return self.to_svg(specs, scale_at)
         settings = self.config["settings"]
         radius = int(settings["corner_radius"])
         rows = []
@@ -3642,6 +3658,39 @@ class TouchBar:
                 fields.append("Stretch = %d" % stretch)
             rows.append("    { %s }," % ", ".join(fields))
         return emit(settings, rows)
+
+    def to_svg(self, specs, scale_at=None):
+        """The whole panel as one document, for renderers that take pixels.
+
+        tiny-dfr drew the esc key and the plain Time/Battery buttons itself;
+        here we own every pixel, so they become ordinary tiles.
+        """
+        settings = self.config["settings"]
+        radius = int(settings["corner_radius"])
+        items = [{"label": "esc", "fill": "sunken", "fg": "muted", "size": 20}] + list(specs)
+        parts = []
+        for index, (item, (left, width)) in enumerate(zip(items, layout_metrics(specs))):
+            if item.get("spacer"):
+                continue
+            if item.get("time"):
+                item = {"label": time.strftime(item["time"]), "size": 22}
+            elif item.get("battery"):
+                item = {"label": "%s%%" % (t1_battery_percent() or "?"), "size": 22}
+            painted = self.paint(item)
+            scale = (scale_at or {}).get(index - 1, 1.0)
+            body = build_svg(painted, width, radius, settings["font"], scale)
+            body = body.replace("<svg ", '<svg x="%.2f" ' % left, 1)
+            # Every tile was its own document for tiny-dfr; here they share
+            # one, so keep their gradient and filter ids from colliding.
+            suffix = "_%d" % index
+            body = re.sub(r'id="(\w+)"', lambda m: 'id="%s%s"' % (m.group(1), suffix), body)
+            body = re.sub(r"url\(#(\w+)\)", lambda m: "url(#%s%s)" % (m.group(1), suffix), body)
+            parts.append(body)
+        return (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d">'
+            '<rect width="%d" height="%d" fill="#000000"/>%s</svg>'
+            % (BAR_WIDTH, BAR_HEIGHT, BAR_WIDTH, BAR_HEIGHT, "".join(parts))
+        )
 
     def paint(self, item):
         """Resolve every colour role in a spec against the current theme."""
@@ -3743,6 +3792,11 @@ class TouchBar:
         self.flush()
 
     def touch_settled(self):
+        if BACKEND == "t1":
+            # The gate protects tiny-dfr's button index across a reload. A
+            # T1 frame carries no state, and holding it back would freeze a
+            # slider under the finger that is dragging it.
+            return True
         if self.pending_since and time.monotonic() - self.pending_since > GATE_TIMEOUT:
             return True                 # watchdog: never stall the bar
         return not self.fn_down and not self.touch_down and (
@@ -3759,9 +3813,12 @@ class TouchBar:
             regions, self.pending_hit_regions = self.pending_hit_regions, None
             self.pending_since = 0.0
             try:
-                # In place, not an atomic rename: tiny-dfr watches this inode.
-                with open(DFR_CONFIG, "w") as handle:
-                    handle.write(text)
+                if BACKEND == "t1":
+                    T1_PANEL.show_svg(text)
+                else:
+                    # In place, not an atomic rename: tiny-dfr watches this inode.
+                    with open(DFR_CONFIG, "w") as handle:
+                        handle.write(text)
                 self.last_written = text
                 self.last_change = time.monotonic()
                 if actions is not None:
@@ -3948,7 +4005,10 @@ class TouchBar:
             if value == "next":
                 base = self.page if self.page in self.pages() else "auto"
                 self.page = self.pages()[(self.pages().index(base) + 1) % len(self.pages())]
-            elif value in ("workspaces", "claude", "chatgpt", "models", "efforts"):
+            elif value in ("workspaces", "claude", "chatgpt", "models", "efforts",
+                           "football"):
+                # Football is also a regular page, but its close button sends
+                # page:football, so it must toggle like the overlays.
                 self.page = "auto" if self.page == value else value
             elif value in self.pages():
                 self.page = value
@@ -3998,6 +4058,32 @@ class TouchBar:
             hypr('dispatch hl.dsp.focus({ window = "address:%s" })' % value,
                  as_json=False)
             self.invalidate_state()
+        elif kind == "run" and value:
+            self.run_launcher(value)
+        elif kind == "type" and value:
+            # Symbols typed as text, not as a chord: SHIFT+2 is only "@" on a
+            # US layout (on German it is '"'), while wtype's text mode sends
+            # the character itself whatever the keyboard layout.
+            threading.Thread(target=run_wtype, args=([value],), daemon=True).start()
+
+    def run_launcher(self, name):
+        """Start a program named in the user's [launchers] table.
+
+        Buttons only carry the name, so nothing on the bar can spell out a
+        command; the argv lives in the user's own config file. It runs as a
+        transient user unit so it survives this daemon being restarted - a
+        Touch Bar game swaps the T1Bridge renderer, which stops us.
+        """
+        argv = self.config.get("launchers", {}).get(name)
+        if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
+            sys.stderr.write("omarchy-touchbar: no launcher named %r\n" % name)
+            return
+        try:
+            subprocess.Popen(["systemd-run", "--user", "--collect", "--quiet", "--"] + argv,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError as exc:
+            sys.stderr.write("omarchy-touchbar: cannot run %s: %s\n" % (name, exc))
 
     def system_control(self, value):
         """Adjust icon-only hardware controls without showing metric tiles."""
@@ -4266,6 +4352,386 @@ def preview(bar, out="/tmp/omarchy-touchbar-preview.png", what="auto"):
         handle.write(svg)
     subprocess.run([RSVG_CONVERT_BIN, "-o", out, source], check=True)
     return out
+
+
+# --------------------------------------------------------------- T1Bridge --
+# Touch Bar hardware IPC v1 (t1bridge docs/interfaces.md). Every packet is a
+# 16-byte header then a packed payload; frames travel in sealed memfds.
+T1_HEADER = struct.Struct("<4sHHII")
+T1_FEATURES = 0x27                  # memfd frames, input, key taps, Touch ID cancel
+T1_HELLO, T1_REGISTER, T1_SUBMIT, T1_TAP_KEYS = 0x0001, 0x0002, 0x0003, 0x0004
+T1_HELLO_ACK, T1_ACK, T1_ERROR = 0x8001, 0x8002, 0x8003
+T1_RELEASED, T1_INPUT = 0x9001, 0x9002
+T1_KEY_ESC = 1
+T1_BUFFERS = 2
+# tiny-dfr blanked the panel after a minute without input; an OLED left
+# showing a static layout all day burns in, so keep that behaviour.
+T1_BLANK_AFTER = float(os.environ.get("OMARCHY_TOUCHBAR_BLANK_AFTER", "60"))
+T1_PANEL = None
+# t1bridge's broker publishes the running Touch ID prompt here, one JSON line
+# ({"version":1,"pid":N,"state":"authenticate"}); the built-in renderer draws
+# it, a custom renderer has to do the same or the sensor arms unannounced.
+T1_TOUCH_ID_STATE = "/run/t1bridge/touch-id-state.json"
+T1_TOUCH_ID_PROMPTS = {             # state -> (message, accent)
+    "authenticate": ("Touch ID  ·  place your finger on the sensor", "#7daea3"),
+    "enroll": ("Touch ID  ·  place your finger on the sensor", "#7daea3"),
+    "retry": ("Not recognised  ·  try again", "#d8a657"),
+    "success": ("Recognised", "#a9b665"),
+    "failure": ("Touch ID failed  ·  use your password", "#ea6962"),
+    "failed": ("Touch ID failed  ·  use your password", "#ea6962"),
+    "locked": ("Touch ID locked  ·  use your password", "#ea6962"),
+}
+
+
+def t1_battery_percent():
+    for path in sorted(glob.glob("/sys/class/power_supply/BAT*/capacity")):
+        try:
+            with open(path) as handle:
+                return int(handle.read().strip())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+try:
+    import gi
+    gi.require_version("Rsvg", "2.0")
+    from gi.repository import Rsvg
+    from gi.repository import GLib
+    import cairo
+    GLib_Error = GLib.Error
+except (ImportError, ValueError):
+    Rsvg = None
+    GLib_Error = OSError
+
+
+def t1_rasterize(svg, width, height):
+    """SVG -> XRGB8888 little-endian rows (B, G, R, X), `width * 4` stride."""
+    if Rsvg is not None:
+        handle = Rsvg.Handle.new_from_data(svg.encode())
+        # Cairo's RGB24 is XRGB8888 in native byte order - the panel's format.
+        surface = cairo.ImageSurface(cairo.FORMAT_RGB24, width, height)
+        context = cairo.Context(surface)
+        viewport = Rsvg.Rectangle()
+        viewport.x, viewport.y = 0, 0
+        viewport.width, viewport.height = width, height
+        handle.render_document(context, viewport)
+        surface.flush()
+        data, stride = bytes(surface.get_data()), surface.get_stride()
+        if stride == width * 4:
+            return data
+        return b"".join(data[row * stride:row * stride + width * 4]
+                        for row in range(height))
+    png = subprocess.run([RSVG_CONVERT_BIN, "-w", str(width), "-h", str(height)],
+                         input=svg.encode(), capture_output=True, check=True).stdout
+    return subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-f", "png_pipe", "-i", "-",
+         "-f", "rawvideo", "-pix_fmt", "bgr0", "-"],
+        input=png, capture_output=True, check=True).stdout
+
+
+class T1Panel:
+    """One renderer connection to t1-touchbar-hw.
+
+    Frames go out through a small ring of sealed memfds; the service owns a
+    buffer from SubmitFrame until FrameReleased, so a newer frame that finds
+    no free buffer waits as `pending` and only the latest one is kept.
+    """
+
+    def __init__(self):
+        self.sock = None
+        self.lock = threading.Lock()
+        self.request = 1
+        self.buffers = {}             # buffer id -> memfd
+        self.free = []
+        self.inflight = {}            # request id -> buffer id
+        self.pending = None
+        self.frame_id = 0
+        self.width = BAR_WIDTH
+        self.height = BAR_HEIGHT
+        self.blank = False
+        self.last_pixels = None
+        self.overlay = None           # Touch ID prompt pixels, shown over the bar
+        self.events = None            # queue of (fn, contacts) for the input worker
+
+    def _packet(self, mtype, request, payload=b""):
+        return T1_HEADER.pack(b"T1HW", 1, mtype, len(payload), request) + payload
+
+    def _next_request(self):
+        self.request += 1
+        return self.request
+
+    def _receive(self, timeout=None):
+        if timeout is not None:
+            ready, _, _ = select.select([self.sock], [], [], timeout)
+            if not ready:
+                raise OSError("t1bridge did not answer")
+        data = self.sock.recv(65536)
+        if not data:
+            raise OSError("t1bridge closed the connection")
+        _, _, mtype, length, request = T1_HEADER.unpack_from(data)
+        return mtype, request, data[T1_HEADER.size:T1_HEADER.size + length]
+
+    def _await(self, request, want):
+        """Wait for one reply during setup; early touch events are dropped."""
+        while True:
+            mtype, rid, payload = self._receive(timeout=2.0)
+            if rid == 0:
+                continue
+            if mtype == T1_ERROR:
+                raise OSError("t1bridge error %d" % struct.unpack("<I", payload)[0])
+            if mtype != want or rid != request:
+                raise OSError("t1bridge sent an unexpected reply")
+            return payload
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX,
+                                  socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+        self.sock.connect(T1_SOCKET)
+        self.sock.send(self._packet(T1_HELLO, 1, struct.pack("<HHQ", 0, 0, T1_FEATURES)))
+        _, _, width, height, pixel_format, max_buffers = struct.unpack(
+            "<HHIIII", self._await(1, T1_HELLO_ACK))
+        if pixel_format != 1:
+            raise OSError("unsupported t1bridge pixel format %d" % pixel_format)
+        self.width, self.height = width, height
+        length = width * 4 * height
+        for buffer_id in range(1, min(T1_BUFFERS, max_buffers) + 1):
+            fd = os.memfd_create("omarchy-touchbar", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+            os.ftruncate(fd, length)
+            fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
+                        fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
+            request = self._next_request()
+            socket.send_fds(self.sock, [self._packet(
+                T1_REGISTER, request, struct.pack("<IIQ", buffer_id, width * 4, length))], [fd])
+            self._await(request, T1_ACK)
+            self.buffers[buffer_id] = fd
+            self.free.append(buffer_id)
+        self.events = queue.Queue()
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        try:
+            while True:
+                mtype, rid, payload = self._receive()
+                if mtype == T1_INPUT:
+                    _, fn, count, _ = struct.unpack_from("<QBBH", payload)
+                    contacts = [struct.unpack_from("<BBBBII", payload, 12 + 12 * i)
+                                for i in range(count)]
+                    # (id, tip, in_range, _, x, y) -> only touching fingers
+                    self.events.put((bool(fn), [(c[0], c[4]) for c in contacts if c[1]]))
+                    continue
+                with self.lock:
+                    if mtype == T1_RELEASED:
+                        buffer_id, _ = struct.unpack("<IQ", payload)
+                        self.free.append(buffer_id)
+                        if self.pending is not None:
+                            pixels, self.pending = self.pending, None
+                            self._submit(pixels)
+                    elif mtype == T1_ACK:
+                        self.inflight.pop(rid, None)
+                    elif mtype == T1_ERROR:
+                        code = struct.unpack("<I", payload)[0]
+                        sys.stderr.write("omarchy-touchbar: t1bridge error %d\n" % code)
+                        buffer_id = self.inflight.pop(rid, None)
+                        if buffer_id is not None:     # a rejected frame keeps its buffer
+                            self.free.append(buffer_id)
+        except OSError as exc:
+            # Without the panel there is nothing to do. Exiting lets the
+            # T1Bridge launcher fall back to its built-in renderer.
+            sys.stderr.write("omarchy-touchbar: lost the Touch Bar: %s\n" % exc)
+            os._exit(1)
+
+    def _submit(self, pixels):
+        """Caller holds self.lock."""
+        if not self.free:
+            self.pending = pixels
+            return
+        buffer_id = self.free.pop(0)
+        os.pwrite(self.buffers[buffer_id], pixels, 0)
+        self.frame_id += 1
+        request = self._next_request()
+        self.inflight[request] = buffer_id
+        self.sock.send(self._packet(T1_SUBMIT, request,
+                                    struct.pack("<IQI", buffer_id, self.frame_id, 0)))
+
+    def show_svg(self, svg):
+        try:
+            pixels = t1_rasterize(svg, self.width, self.height)
+        except (subprocess.SubprocessError, GLib_Error) as exc:
+            raise OSError("cannot rasterise the bar: %s" % exc)
+        with self.lock:
+            self.last_pixels = pixels
+            if not self.blank and self.overlay is None:
+                self._submit(pixels)
+
+    def set_blank(self, blank):
+        with self.lock:
+            blank = blank and self.overlay is None    # never hide a Touch ID prompt
+            if blank == self.blank:
+                return
+            self.blank = blank
+            if blank:
+                self._submit(bytes(self.width * 4 * self.height))
+            elif self.overlay is not None:
+                self._submit(self.overlay)
+            elif self.last_pixels is not None:
+                self._submit(self.last_pixels)
+
+    def set_overlay(self, pixels):
+        """Show `pixels` over the bar until called again with None."""
+        with self.lock:
+            self.overlay = pixels
+            if pixels is not None:
+                self.blank = False
+                self._submit(pixels)
+            elif self.blank:
+                self._submit(bytes(self.width * 4 * self.height))
+            elif self.last_pixels is not None:
+                self._submit(self.last_pixels)
+
+    def tap_keys(self, codes):
+        payload = struct.pack("<B3x4H", len(codes), *(list(codes) + [0] * (4 - len(codes))))
+        with self.lock:
+            self.sock.send(self._packet(T1_TAP_KEYS, self._next_request(), payload))
+
+
+def t1_input(bar, panel):
+    """Turn T1Bridge contact frames into the same bar calls watch_touches makes.
+
+    Contacts arrive in panel pixels and T1 reports no useful height, so a
+    finger is only an x position - which is all the hit test ever used.
+    """
+    swipe_px = SWIPE_THRESHOLD_RAW / 32767.0 * BAR_WIDTH
+    fn_was = False
+    finger = None             # id of the contact we are following
+    start_x = last_x = 0.0
+    started_at = 0.0
+    swallow = False           # the tap that woke a blank panel does nothing else
+    bar.t1_last_input = time.monotonic()
+    while True:
+        fn, contacts = panel.events.get()
+        now = time.monotonic()
+        bar.t1_last_input = now
+        if panel.overlay is not None:
+            # The buttons are hidden behind the Touch ID prompt; a touch there
+            # must not fire whatever sits underneath.
+            finger = None
+            swallow = bool(contacts)
+            continue
+        try:
+            if fn != fn_was:
+                fn_was = fn
+                if panel.blank:
+                    panel.set_blank(False)
+                if fn:
+                    bar.fn_down = True
+                    bar.toggle_fn_dashboard()
+                else:
+                    bar.fn_down = False
+                    bar.touch_released_at = now
+                    bar.flush()
+            if panel.blank and contacts:
+                panel.set_blank(False)
+                swallow = True
+                continue
+            if swallow:
+                swallow = bool(contacts)
+                continue
+            current = dict(contacts)
+            if finger is None and current:
+                finger = min(current)
+                start_x = last_x = float(current[finger])
+                started_at = now
+                bar.touch_down = True
+                bar.begin_drag(start_x)
+            elif finger is not None and finger in current:
+                last_x = float(current[finger])
+                if bar.drag:
+                    bar.move_drag(last_x)
+            elif finger is not None:
+                finger = None
+                bar.touch_down = False
+                bar.touch_released_at = now
+                if bar.drag:
+                    bar.last_touch = {"x": last_x, "slider": bar.drag[0],
+                                      "level": bar.drag_level}
+                    bar.end_drag()
+                    continue
+                pixel_x = max(0.0, min(BAR_WIDTH - 0.01, last_x))
+                delta = last_x - start_x
+                if abs(delta) >= swipe_px and now - started_at <= SWIPE_MAX_SECONDS:
+                    direction = "left" if delta < 0 else "right"
+                    bar.last_touch = {"x": last_x, "swipe": direction, "delta": delta}
+                    bar.handle_swipe(direction)
+                    continue
+                index, action = bar.action_at_pixel(pixel_x)
+                if index is None:
+                    continue
+                bar.last_touch = {"x": last_x, "slot": index, "action": action}
+                sys.stderr.write("omarchy-touchbar: t1 touch x=%d slot=%d action=%s\n"
+                                 % (last_x, index, action))
+                if index == 0 and action is None:
+                    panel.tap_keys([T1_KEY_ESC])      # tiny-dfr's own esc key
+                else:
+                    bar.handle_touch_action(action)
+        except Exception as exc:  # noqa: BLE001 - keep the input thread alive
+            sys.stderr.write("omarchy-touchbar: touch failed: %s\n" % exc)
+
+
+def t1_touch_id_svg(state, width, height):
+    message, accent = T1_TOUCH_ID_PROMPTS.get(state, ("Touch ID", "#7daea3"))
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d">'
+        '<rect width="100%%" height="100%%" fill="#000"/>'
+        '<g font-family="JetBrainsMono Nerd Font" font-weight="bold" '
+        'text-anchor="middle" dominant-baseline="central">'
+        '<text x="%d" y="%d" font-size="34" fill="%s">\U000f0237</text>'
+        '<text x="%d" y="%d" font-size="22" fill="#d4be98">%s</text>'
+        '</g></svg>'
+        % (width, height, width // 2 - 290, height // 2, accent,
+           width // 2 + 20, height // 2, html.escape(message)))
+
+
+def t1_watch_touch_id(panel):
+    """Mirror t1bridge's Touch ID prompt onto the panel while it runs."""
+    shown = None
+    while True:
+        time.sleep(0.1)
+        state = None
+        try:
+            with open(T1_TOUCH_ID_STATE) as handle:
+                record = json.loads(handle.read(4096) or "null")
+            # A record left behind by a dead broker is not a live prompt.
+            if isinstance(record, dict) and record.get("version") == 1 \
+                    and os.path.exists("/proc/%d" % int(record.get("pid", 0))):
+                state = str(record.get("state", ""))
+        except (OSError, ValueError, TypeError):
+            pass
+        if state == shown:
+            continue
+        shown = state
+        try:
+            if state is None:
+                panel.set_overlay(None)
+            else:
+                panel.set_overlay(t1_rasterize(
+                    t1_touch_id_svg(state, panel.width, panel.height),
+                    panel.width, panel.height))
+        except (OSError, subprocess.SubprocessError, GLib_Error) as exc:
+            sys.stderr.write("omarchy-touchbar: Touch ID prompt failed: %s\n" % exc)
+
+
+def t1_blank_when_idle(bar, panel):
+    """Blank the panel after a quiet minute, but never while work is showing."""
+    while True:
+        time.sleep(1.0)
+        busy = bar.voice_state in ("recording", "transcribing") \
+            or (bar.claude is not None and bar.claude.busy)
+        idle = time.monotonic() - getattr(bar, "t1_last_input", 0.0) > T1_BLANK_AFTER
+        try:
+            panel.set_blank(idle and not busy)
+        except OSError:
+            pass
 
 
 # ------------------------------------------------------------------ daemon --
@@ -5090,16 +5556,29 @@ def watch_goals(bar):
 
 
 def run_daemon():
+    global T1_PANEL
+    if BACKEND == "t1":
+        # Connect before anything renders: flush() draws straight to it.
+        T1_PANEL = T1Panel()
+        T1_PANEL.connect()
     bar = TouchBar(clear_cache=True)
 
     def bye(*_):
-        restore_static()
+        if BACKEND != "t1":           # T1Bridge restores its own renderer
+            restore_static()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, bye)
     signal.signal(signal.SIGINT, bye)
-    threading.Thread(target=watch_fn, args=(bar,), daemon=True).start()
-    threading.Thread(target=watch_touches, args=(bar,), daemon=True).start()
+    if BACKEND == "t1":
+        threading.Thread(target=t1_input, args=(bar, T1_PANEL), daemon=True).start()
+        threading.Thread(target=t1_blank_when_idle, args=(bar, T1_PANEL),
+                         daemon=True).start()
+        threading.Thread(target=t1_watch_touch_id, args=(T1_PANEL,),
+                         daemon=True).start()
+    else:
+        threading.Thread(target=watch_fn, args=(bar,), daemon=True).start()
+        threading.Thread(target=watch_touches, args=(bar,), daemon=True).start()
     threading.Thread(target=drain, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_voxtype, args=(bar,), daemon=True).start()
     threading.Thread(target=watch_voice_levels, args=(bar,), daemon=True).start()

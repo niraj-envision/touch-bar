@@ -5,7 +5,11 @@
 # the bar. Labels are plain text: any glyph from JetBrainsMono Nerd Font works
 # (https://www.nerdfonts.com/cheat-sheet). `keys` is a chord sent to the focused
 # window, e.g. "CTRL+SHIFT+Tab", "SUPER+Return", "ALT+Left", or a raw key name
-# like "PlayPause".
+# like "PlayPause". `text` types a string instead, which keeps symbols like
+# "@" right on any keyboard layout. `run = "<name>"` starts the command listed
+# under that name in a [launchers] table you add yourself, e.g.
+#   [launchers]
+#   game = ["python3", "/path/to/game.py"]
 #
 # `color` and `background` accept a theme role - surface, sunken, raised,
 # accent, on_accent, fg, muted - or any colour name from the theme's
@@ -115,8 +119,8 @@ show_identity = false       # the live status tile is the identity
 buttons = [
   { label = "{mode}", keys = "SHIFT+Tab", size = 18, background = "raised", hint = "Cycle permission mode" },
   { label = "/",      keys = "Slash",     size = 27, hint = "Slash commands" },
-  { label = "@",      keys = "SHIFT+2",   size = 25, hint = "Mention a file" },
-  { label = "!",      keys = "SHIFT+1",   size = 27, color = "green", hint = "Bash mode" },
+  { label = "@",      text = "@",         size = 25, hint = "Mention a file" },
+  { label = "!",      text = "!",         size = 27, color = "green", hint = "Bash mode" },
 ]
 
 [[profiles]]

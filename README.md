@@ -1,7 +1,8 @@
 # Omarchy Touch Bar
 
-A context-aware Touch Bar for Intel T2 MacBooks running Omarchy and Hyprland.
-It uses `tiny-dfr` as the renderer and replaces a static function row with a
+A context-aware Touch Bar for Intel T2 MacBooks (and T1 models through
+T1Bridge) running Omarchy and Hyprland.
+On T2 it renders through `tiny-dfr`. It replaces a static function row with a
 full-height, themed interface that follows the focused app.
 
 ![Omarchy Touch Bar preview](preview.png)
@@ -57,8 +58,9 @@ full-height, themed interface that follows the focused app.
 ## Requirements
 
 - Omarchy with Hyprland
-- A supported Apple T2 Touch Bar exposed through Linux input devices
-- `tiny-dfr`
+- A supported Apple T2 Touch Bar exposed through Linux input devices, or a
+  T1 Touch Bar driven by [T1Bridge](https://github.com/standardagents/t1bridge)
+- `tiny-dfr` (T2 only)
 - Python 3.11 or newer
 - `wtype`, `librsvg` (`rsvg-convert`), `brightnessctl`, `wpctl`
 - GTK 4 and libadwaita with Python bindings (`python-gobject`) for the settings app
@@ -93,6 +95,41 @@ the Omarchy theme hook, and starts the daemon. It asks for `sudo` only to
 prepare `/etc/tiny-dfr`, allow the session to hold the Touch Bar backlight,
 and install the post-resume panel reset. `./uninstall.sh` reverses the
 user-level parts.
+
+### T1 MacBooks (2016/2017)
+
+T1 models (MacBookPro13,2/13,3/14,2/14,3) have no `tiny-dfr`. There,
+[T1Bridge](https://github.com/standardagents/t1bridge) owns the panel and
+hands a user renderer full pixel frames and touch contacts over
+`/run/t1bridge/touchbar.sock`. The daemon picks that backend on its own when
+the socket exists and `/etc/tiny-dfr` does not; `OMARCHY_TOUCHBAR_BACKEND=t1`
+or `=dfr` forces either one.
+
+With T1Bridge working (its built-in bar lights up), skip `install.sh`, which
+targets `tiny-dfr`, and register the daemon as T1Bridge's renderer instead:
+
+```bash
+install -Dm0755 src/omarchy-touchbar ~/.local/bin/omarchy-touchbar
+install -Dm0644 config/touchbar.toml ~/.config/omarchy/touchbar.toml   # first time only
+printf '#!/bin/sh\nexport OMARCHY_TOUCHBAR_BACKEND=t1\nexec %s daemon\n' \
+  "$HOME/.local/bin/omarchy-touchbar" > ~/.local/bin/omarchy-touchbar-t1
+chmod 0755 ~/.local/bin/omarchy-touchbar-t1
+mkdir -p ~/.config/t1bridge
+ln -sf ~/.local/bin/omarchy-touchbar-t1 ~/.config/t1bridge/renderer
+systemctl --user restart t1-touchbar.service
+```
+
+Undo with `rm ~/.config/t1bridge/renderer` and the same restart; T1Bridge's
+built-in bar comes back. Logs are in `journalctl --user -u t1-touchbar.service`.
+If the daemon exits, T1Bridge falls back to its built-in renderer, so a
+broken config never leaves the bar dark.
+
+On T1 the panel is 2170×60 and reports only horizontal touch positions.
+While T1Bridge shows a Touch ID prompt (`/run/t1bridge/touch-id-state.json`),
+the bar mirrors it as a full-width overlay and ignores taps. Pages, sliders,
+workspaces, app context, dictation and the Fn key behave as on T2. The
+post-resume panel reset does not apply: the T1 stack does not survive
+suspend yet, so power the Mac off and on to bring the bar back.
 
 ## Commands
 
